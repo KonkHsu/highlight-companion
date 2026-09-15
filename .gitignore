@@ -1,0 +1,12 @@
+node_modules/
+main.js
+*.map
+data.json
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+release/

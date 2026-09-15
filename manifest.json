@@ -1,0 +1,9 @@
+{
+  "id": "highlight-companion",
+  "name": "重点收录",
+  "version": "0.2.0",
+  "minAppVersion": "1.7.2",
+  "description": "高亮课本重点，按章节持续收录、整理关键词，并生成可编辑的 Canvas 思维导图。",
+  "author": "Highlight Companion",
+  "isDesktopOnly": false
+}

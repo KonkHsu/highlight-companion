@@ -1,0 +1,45 @@
+.hc-toolbar, .hc-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 20px; }
+.hc-toolbar { padding: 12px; border: 1px solid var(--background-modifier-border); border-radius: 10px; background: var(--background-secondary); }
+.hc-organizer { width: min(820px, 92vw); }
+.hc-organizer .modal-content { padding-bottom: 12px; }
+.hc-subtitle, .hc-selection { color: var(--text-muted); }
+.hc-selection { font-size: var(--font-ui-small); }
+.hc-chapter { border-top: 1px solid var(--background-modifier-border); margin-top: 20px; padding-top: 4px; }
+.hc-chapter h3 { font-size: var(--font-ui-medium); color: var(--text-muted); }
+.hc-row { display: flex; align-items: flex-start; gap: 12px; padding: 12px; border-radius: 8px; cursor: pointer; overflow-wrap: anywhere; }
+.hc-row:hover { background: var(--background-secondary); }
+.hc-row input { flex-shrink: 0; margin-top: 4px; }
+.hc-group-label { display: block; color: var(--text-accent); margin-top: 5px; }
+.hc-organizer .setting-item-control input[type=text] { width: 300px; max-width: 100%; }
+
+.hc-panel-actions { display: grid; gap: 10px; margin-block: 16px; }
+.hc-panel-actions button, .hc-close { min-height: 44px; height: auto; white-space: normal; }
+.hc-capture-preview { padding: 12px; border-radius: 8px; background: var(--background-secondary); max-height: 160px; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; }
+.hc-close { margin-top: 12px; }
+.hc-responsive-modal .setting-item-info, .hc-responsive-modal .setting-item-control, .hc-row > div { min-width: 0; }
+.hc-responsive-modal .setting-item-name, .hc-settings .setting-item-name, .hc-settings .setting-item-description { overflow-wrap: anywhere; }
+.hc-responsive-modal button, .hc-toolbar button { touch-action: manipulation; }
+.hc-responsive-modal button:focus-visible, .hc-row:focus-within { outline: 2px solid var(--interactive-accent); outline-offset: 2px; }
+
+@media (max-width: 600px), (pointer: coarse) {
+  .hc-responsive-modal { width: min(820px, 100%); max-width: 100%; box-sizing: border-box; }
+  .hc-responsive-modal .modal-content { overflow-y: auto; overscroll-behavior: contain; padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+  .hc-responsive-modal .setting-item, .hc-settings .setting-item { flex-direction: column; align-items: stretch; gap: 8px; }
+  .hc-responsive-modal .setting-item-info, .hc-settings .setting-item-info { margin-right: 0; }
+  .hc-responsive-modal .setting-item-control { width: 100%; justify-content: stretch; }
+  .hc-responsive-modal .setting-item-control input[type=text], .hc-responsive-modal .setting-item-control select { width: 100%; min-width: 0; max-width: 100%; font-size: 16px; min-height: 44px; }
+  .hc-responsive-modal .setting-item-control button { flex: 1; min-width: 0; min-height: 44px; height: auto; white-space: normal; }
+  .hc-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .hc-actions button, .hc-toolbar button { min-height: 44px; height: auto; padding: 10px; white-space: normal; }
+  .hc-actions .mod-cta { grid-column: 1 / -1; }
+  .hc-toolbar { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .hc-row { min-height: 48px; box-sizing: border-box; padding: 12px 8px; }
+  .hc-row input[type=checkbox] { width: 22px; height: 22px; margin-top: 0; }
+  .hc-row:has(input:checked) { background: var(--background-secondary); }
+  .hc-selection { position: sticky; top: 0; z-index: 1; padding: 10px 0; background: var(--background-primary); }
+  .hc-close { width: 100%; }
+}
+/* Obsidian's desktop mobile emulator also uses .is-mobile without a coarse pointer. */
+.is-mobile .hc-responsive-modal input[type=text], .is-mobile .hc-responsive-modal select { font-size: 16px; }
+.is-mobile .hc-responsive-modal button { min-height: 44px; height: auto; white-space: normal; }
+.hc-panel .modal-content > * { flex-shrink: 0; }
