@@ -43,3 +43,36 @@
 .is-mobile .hc-responsive-modal input[type=text], .is-mobile .hc-responsive-modal select { font-size: 16px; }
 .is-mobile .hc-responsive-modal button { min-height: 44px; height: auto; white-space: normal; }
 .hc-panel .modal-content > * { flex-shrink: 0; }
+
+.hc-reading-actions {
+  position: fixed;
+  z-index: var(--layer-menu, 1000);
+  display: flex;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: var(--background-primary);
+  box-shadow: var(--shadow-s);
+  transform: translate(-50%, -100%);
+}
+.hc-reading-actions-below { transform: translate(-50%, 0); }
+.hc-reading-actions button { min-height: 40px; height: auto; padding-inline: 12px; touch-action: manipulation; white-space: nowrap; }
+.hc-selection-tools { display: flex; gap: 8px; margin: 8px 0; }
+.hc-selection-tools button { min-height: 40px; }
+.hc-keyword-list { margin-top: 8px; }
+.hc-merge-footer { position: sticky; bottom: 0; z-index: 2; display: grid; gap: 6px; margin-top: 16px; padding: 12px; border: 1px solid var(--background-modifier-border); border-radius: 12px; background: var(--background-primary); box-shadow: 0 -6px 18px rgb(0 0 0 / 8%); }
+.hc-merge-footer .hc-selection { position: static; margin: 0; padding: 0; }
+.hc-merge-footer button { width: 100%; min-height: 44px; }
+.hc-picked-keywords { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+.hc-picked-keywords span { padding: 7px 10px; border-radius: 999px; background: var(--background-secondary); overflow-wrap: anywhere; }
+.hc-name-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; }
+.hc-name-actions button { min-height: 44px; height: auto; white-space: normal; }
+.hc-manage { margin-top: 20px; padding: 12px; border-top: 1px solid var(--background-modifier-border); }
+.hc-manage summary { cursor: pointer; color: var(--text-muted); font-weight: var(--font-semibold); }
+
+@media (max-width: 600px), (pointer: coarse) {
+  .hc-reading-actions { max-width: calc(100vw - 16px); }
+  .hc-reading-actions button { min-height: 44px; font-size: var(--font-ui-small); }
+  .hc-name-actions { grid-template-columns: 1fr; }
+}
