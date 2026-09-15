@@ -38,6 +38,42 @@ test('adapter blocks missing regions before changing a source document', async (
   await assert.rejects(plugin.io.read(binding.target), /收录区域被手动删除/);
   await assert.rejects(plugin.change(binding.target, (text: string) => text + 'new'), /收录区域被手动删除/);
 });
+test('Canvas export creates its folder, avoids collisions and can supplement an archived map', async () => {
+  const { plugin, files } = setup();
+  const b = plugin.state.bindings[0];
+  const folders = new Set<string>();
+  const lookup = plugin.app.vault.getAbstractFileByPath;
+  plugin.app.vault.getAbstractFileByPath = (p: string) => folders.has(p) ? { path: p } : lookup(p);
+  plugin.app.vault.createFolder = async (p: string) => { folders.add(p); };
+  plugin.app.vault.create = async (p: string, text: string) => {
+    assert(folders.has(p.slice(0, p.lastIndexOf('/'))));
+    assert(!files.has(p)); files.set(p, text);
+  };
+  plugin.open = async () => {};
+  assert.deepEqual(plugin.canvasChoices(b), []); // The previously recorded file is missing.
+  await plugin.exportCanvas(b, true);
+  const first = b.canvas;
+  assert.equal(first, '思维导图/重点-思维导图.canvas');
+  const custom = JSON.parse(files.get(first)!);
+  custom.nodes[0].text = '手动编辑'; custom.nodes[0].x = 1234;
+  files.set(first, JSON.stringify(custom));
+  await plugin.exportCanvas(b, true);
+  assert.equal(b.canvas, '思维导图/重点-思维导图-2.canvas');
+  assert.equal(plugin.canvasChoices(b).length, 2);
+  const secondBefore = files.get(b.canvas);
+  const original = files.get(b.source)!;
+  const source = original + '\n\n乙'; files.set(b.source, source);
+  await plugin.collectSnapshot(new TFile(b.source), { source, from: source.length - 1, to: source.length });
+  await plugin.exportCanvas(b, false, first);
+  const supplemented = JSON.parse(files.get(first)!);
+  assert.equal(supplemented.nodes[0].text, '手动编辑');
+  assert.equal(supplemented.nodes[0].x, 1234);
+  assert(supplemented.nodes.length > custom.nodes.length);
+  assert.equal(files.get('思维导图/重点-思维导图-2.canvas'), secondBefore);
+  assert.equal(b.canvas, first);
+  files.delete(first);
+  await assert.rejects(plugin.exportCanvas(b, false, first), /已丢失/);
+});
 test('renames update all recorded Canvas versions and defer edits for an open Canvas', async () => {
   const { plugin, files, note, setLeaves } = setup();
   const canvas = buildCanvas(note, binding), parsed = JSON.parse(canvas);

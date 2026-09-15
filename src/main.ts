@@ -37,7 +37,7 @@ export default class HighlightCompanion extends Plugin {
     this.addCommand({ id: 'import-highlights', name: '收录当前课本已有高亮', icon: 'list-plus', callback: () => this.run(() => this.importActive()) });
     this.addCommand({ id: 'open-note', name: '打开重点笔记', icon: 'notebook-pen', callback: () => this.run(async () => { const b = await this.contextBinding(); await this.open(b.target); }) });
     this.addCommand({ id: 'organize', name: '整理重点', icon: 'list-tree', callback: () => this.run(async () => { const b = await this.contextBinding(); new OrganizeModal(this.app, this, b).open(); }) });
-    this.addCommand({ id: 'canvas-update', name: '生成或增补思维导图', icon: 'git-fork', callback: () => this.run(async () => this.exportCanvas(await this.contextBinding(), false)) });
+    this.addCommand({ id: 'canvas-update', name: '生成或增补思维导图', icon: 'git-fork', callback: () => this.run(async () => this.chooseCanvas(await this.contextBinding())) });
     this.addCommand({ id: 'canvas-new', name: '另存完整思维导图', icon: 'copy-plus', callback: () => this.run(async () => this.exportCanvas(await this.contextBinding(), true)) });
     this.addCommand({ id: 'recover', name: '恢复未完成收录并检查绑定', icon: 'refresh-cw', callback: () => this.run(async () => { await finishPending(this.state, this.io); await this.reconcile(true); new Notice('恢复与检查完成。'); }) });
     this.addRibbonIcon('highlighter', '重点收录：收录与整理', () => this.showPanel());
@@ -130,7 +130,7 @@ export default class HighlightCompanion extends Plugin {
       const add = (name: string, fn: () => void) => { const button = toolbar.createEl('button', { text: name }); child.registerDomEvent(button, 'click', fn); };
       add('整理重点', () => new OrganizeModal(this.app, this, b).open());
       add('撤销高亮与重点', () => new OrganizeModal(this.app, this, b).open());
-      add('生成 / 增补导图', () => this.run(() => this.exportCanvas(b, false)));
+      add('生成 / 增补导图', () => this.chooseCanvas(b));
       add('另存完整导图', () => this.run(() => this.exportCanvas(b, true)));
     });
     this.app.workspace.onLayoutReady(() => this.run(async () => { await finishPending(this.state, this.io); await this.reconcile(); }));
@@ -296,14 +296,22 @@ export default class HighlightCompanion extends Plugin {
     await commitCapture(this.state, this.io, b, { before, after: result.source, chapters: result.chapters, entries: result.entries });
     new Notice(`已收录 ${result.entries.length} 条，跳过 ${result.duplicates} 条已收录高亮。`);
   }
-  async exportCanvas(binding: Binding, fresh: boolean) {
+  canvasChoices(binding: Binding): string[] {
+    return [...new Set([binding.canvas, ...Object.entries(this.state.canvasLedgers ?? {}).filter(([, ledger]) => ledger.binding === binding.id).map(([path]) => path)])]
+      .filter((path): path is string => !!path && this.app.vault.getAbstractFileByPath(path) instanceof TFile);
+  }
+  chooseCanvas(binding: Binding) { new CanvasExportModal(this.app, this, binding).open(); }
+  async exportCanvas(binding: Binding, fresh: boolean, selectedPath?: string) {
     const note = await this.read(binding.target);
     this.validateIndex(note, binding);
-    let path = binding.canvas;
+    let path = selectedPath ?? binding.canvas;
+    if (selectedPath && !this.canvasChoices(binding).includes(selectedPath)) throw new Error('所选导图已丢失或不属于这篇重点笔记，请重新选择或新建导图。');
     if (!path || fresh) {
-      const base = binding.target.replace(/\.md$/, '') + '-思维导图'; path = base + '.canvas';
+      const parent = binding.target.includes('/') ? binding.target.slice(0, binding.target.lastIndexOf('/') + 1) : '';
+      const base = parent + '思维导图/' + this.file(binding.target).basename + '-思维导图'; path = base + '.canvas';
       let suffix = 2; while (this.app.vault.getAbstractFileByPath(path)) path = `${base}-${suffix++}.canvas`;
       const generated = buildCanvas(note, binding);
+      await this.ensureFolder(path);
       await this.app.vault.create(path, generated);
       this.state.canvasLedgers ??= {}; this.state.canvasLedgers[path] = { ...JSON.parse(generated).highlightCompanion, target: binding.target };
       binding.canvas = path; await this.io.save();
@@ -325,7 +333,9 @@ export default class HighlightCompanion extends Plugin {
         ledger = { ...JSON.parse(result).highlightCompanion, target: binding.target };
         return result;
       });
-      this.state.canvasLedgers ??= {}; this.state.canvasLedgers[path] = ledger!; await this.io.save();
+      this.state.canvasLedgers ??= {}; this.state.canvasLedgers[path] = ledger!;
+      binding.canvas = path; await this.io.save();
+      await this.change(binding.target, text => rewriteBinding(text, binding));
     }
     await this.open(path); new Notice(fresh ? '已另存完整导图。' : '导图已生成或增补，已有卡片编辑保持不变。');
   }
@@ -427,7 +437,7 @@ export class CapturePanel extends Modal {
     add('恢复上次撤销', () => this.plugin.restoreUndo(), !!this.plugin.state.lastUndo);
     add('打开重点笔记', async () => this.plugin.open((await this.plugin.contextBinding(this.file)).target));
     add('整理关键词', async () => new OrganizeModal(this.app, this.plugin, await this.plugin.contextBinding(this.file)).open());
-    add('生成 / 增补导图', async () => this.plugin.exportCanvas(await this.plugin.contextBinding(this.file), false));
+    add('生成 / 增补导图', async () => this.plugin.chooseCanvas(await this.plugin.contextBinding(this.file)));
     this.contentEl.createEl('p', { cls: 'hc-subtitle', text: '手机上可在“设置 → 移动端 → 管理工具栏”添加“高亮并收录”，选中文字后直接点击工具栏图标。' });
     const close = this.contentEl.createEl('button', { text: '关闭', cls: 'hc-close' }); close.onclick = () => this.close();
   }
@@ -462,6 +472,30 @@ export class BindModal extends Modal {
   onClose() { if (!this.submitted) this.resolve?.(null); this.contentEl.empty(); }
 }
 
+class CanvasExportModal extends Modal {
+  constructor(app: App, private plugin: HighlightCompanion, private binding: Binding) { super(app); }
+  onOpen() {
+    this.modalEl.addClass('hc-responsive-modal');
+    this.setTitle('生成思维导图');
+    const paths = this.plugin.canvasChoices(this.binding);
+    let selected = paths.includes(this.binding.canvas ?? '') ? this.binding.canvas! : paths[0];
+    this.contentEl.createEl('p', { text: '新建导图会在重点笔记旁自动创建“思维导图”文件夹，并保存一份当前完整内容。' });
+    if (paths.length) {
+      new Setting(this.contentEl).setName('已有思维导图').setDesc('补充只加入未导出的内容，保留手动编辑。请先关闭要补充的导图标签页。').addDropdown(d => {
+        paths.forEach(path => d.addOption(path, path));
+        d.setValue(selected).onChange(value => selected = value);
+      });
+      new Setting(this.contentEl).addButton(button => button.setButtonText('补充至所选导图').setCta().onClick(() => {
+        this.close(); this.plugin.run(() => this.plugin.exportCanvas(this.binding, false, selected));
+      }));
+    } else this.contentEl.createEl('p', { text: '未找到这篇重点笔记可补充的导图。可以新建一份，原来的导图记录会保留。' });
+    new Setting(this.contentEl).addButton(button => button.setButtonText('新建完整思维导图').onClick(() => {
+      this.close(); this.plugin.run(() => this.plugin.exportCanvas(this.binding, true));
+    }));
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
 export class OrganizeModal extends Modal {
   selected = new Set<string>(); title = ''; group = ''; chapter = ''; alive = true; busy = false; step: 'select' | 'name' = 'select';
   constructor(app: App, private plugin: HighlightCompanion, private binding: Binding) { super(app); }
@@ -486,7 +520,7 @@ export class OrganizeModal extends Modal {
       this.renderName(text, parsed, picked);
       return;
     }
-    this.contentEl.createEl('p', { cls: 'hc-subtitle', text: '第 1 步：选择一个章节，再勾选要合并的关键词。' });
+    this.contentEl.createEl('p', { cls: 'hc-subtitle', text: '第 1 步：选择一个章节，再勾选一个或多个关键词来命名重点。' });
     new Setting(this.contentEl).setName('章节筛选').addDropdown(d => {
       for (const c of chapters) {
         const label = [...c.meta.parents.map(id => parsed.chapters.find(x => x.id === id)?.meta.title ?? ''), c.meta.title].join(' / ');
@@ -498,8 +532,8 @@ export class OrganizeModal extends Modal {
     let count: HTMLElement, next: HTMLButtonElement, hint: HTMLElement;
     const refreshSelection = () => {
       count?.setText(`已勾选 ${this.selected.size} 个关键词`);
-      if (next) next.disabled = this.selected.size < 2;
-      hint?.setText(this.selected.size < 2 ? '至少勾选 2 个关键词才能合并。' : '将这些关键词合并为一个可命名的重点。');
+      if (next) next.disabled = this.selected.size === 0;
+      hint?.setText(this.selected.size === 0 ? '请勾选至少 1 个关键词。' : this.selected.size === 1 ? '为这个关键词创建一个命名重点。' : '将这些关键词合并为一个可命名的重点。');
     };
     const selectionTools = this.contentEl.createDiv({ cls: 'hc-selection-tools' });
     const all = selectionTools.createEl('button', { text: '本章全选' });
@@ -521,14 +555,15 @@ export class OrganizeModal extends Modal {
     count = footer.createEl('p', { cls: 'hc-selection', text: `已勾选 ${this.selected.size} 个关键词` });
     count.setAttribute('role', 'status'); count.setAttribute('aria-live', 'polite');
     next = footer.createEl('button', { text: '下一步：命名重点', cls: 'mod-cta' });
-    next.disabled = this.selected.size < 2;
+    next.disabled = this.selected.size === 0;
     next.onclick = () => { this.step = 'name'; void this.render(); };
-    hint = footer.createEl('small', { text: this.selected.size < 2 ? '至少勾选 2 个关键词才能合并。' : '将这些关键词合并为一个可命名的重点。' });
+    hint = footer.createEl('small');
+    refreshSelection();
     this.renderManage(text, parsed);
     const done = this.contentEl.createEl('button', { text: '完成', cls: 'hc-close' }); done.onclick = () => this.close();
   }
   renderName(text: string, parsed: ReturnType<typeof parseDocument>, picked: ReturnType<typeof parseDocument>['entries']) {
-    if (picked.length < 2 || new Set(picked.map(e => e.meta.chapter)).size !== 1) { this.step = 'select'; void this.render(); return; }
+    if (!picked.length || new Set(picked.map(e => e.meta.chapter)).size !== 1) { this.step = 'select'; void this.render(); return; }
     this.contentEl.createEl('p', { cls: 'hc-subtitle', text: '第 2 步：确认关键词并给这个重点命名。' });
     const summary = this.contentEl.createDiv({ cls: 'hc-picked-keywords' });
     for (const entry of picked) summary.createEl('span', { text: entryText(text, entry) });
@@ -539,7 +574,7 @@ export class OrganizeModal extends Modal {
     });
     const actions = this.contentEl.createDiv({ cls: 'hc-name-actions' });
     const back = actions.createEl('button', { text: '返回修改选择' });
-    merge = actions.createEl('button', { text: `合并 ${picked.length} 个关键词`, cls: 'mod-cta' });
+    merge = actions.createEl('button', { text: picked.length === 1 ? '创建命名重点' : `合并 ${picked.length} 个关键词`, cls: 'mod-cta' });
     merge.disabled = !this.title.trim();
     back.onclick = () => { this.step = 'select'; void this.render(); };
     merge.onclick = () => {
@@ -548,7 +583,7 @@ export class OrganizeModal extends Modal {
         const latest = parseDocument(current);
         if (ids.some(id => !latest.entries.some(e => e.id === id))) throw new Error('部分关键词已被删除，请重新选择。');
         return arrange(current, ids, { type: 'create', title });
-      }, `已将 ${ids.length} 个关键词合并为重点「${title.trim()}」。`));
+      }, ids.length === 1 ? `已创建重点「${title.trim()}」。` : `已将 ${ids.length} 个关键词合并为重点「${title.trim()}」。`));
     };
   }
   renderManage(text: string, parsed: ReturnType<typeof parseDocument>) {
