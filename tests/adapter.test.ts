@@ -6,6 +6,7 @@ import { capture } from '../src/source';
 import { newDocument, appendEntries, parseDocument } from '../src/document';
 import { buildCanvas } from '../src/canvas';
 import { Binding } from '../src/model';
+import { finishPending } from '../src/engine';
 const bundle = await build({ entryPoints: ['tests/adapter-harness.ts'], bundle: true, write: false, platform: 'node', format: 'esm', alias: { obsidian: path.resolve('tests/obsidian-mock.ts') } });
 const { HighlightCompanion, TFile, MarkdownView } = await import('data:text/javascript;base64,' + Buffer.from(bundle.outputFiles[0].text).toString('base64'));
 const binding: Binding = { id: 'book', source: '课本.md', target: '重点.md', canvas: '重点.canvas' };
@@ -20,6 +21,17 @@ function setup() {
   plugin.saveData = async () => {};
   return { plugin, files, note, setLeaves: (value: any[]) => leaves = value };
 }
+test('reading-view snapshots support collection, undo, and stale-selection protection', async () => {
+  const { plugin, files } = setup();
+  const file = new TFile(binding.source), source = files.get(binding.source)!;
+  const from = source.indexOf('甲');
+  await plugin.undoSnapshot(file, { source, from, to: from + 1 });
+  assert.equal(parseDocument(files.get(binding.target)!).entries.length, 0);
+  await assert.rejects(plugin.undoSnapshot(file, { source, from, to: from + 1 }), /笔记已变化/);
+  const next = files.get(binding.source)!;
+  await plugin.collectSnapshot(file, { source: next, from: next.indexOf('甲'), to: next.indexOf('甲') + 1 });
+  assert.equal(parseDocument(files.get(binding.target)!).entries.length, 1);
+});
 test('adapter blocks missing regions before changing a source document', async () => {
   const { plugin, files, note } = setup();
   const r = parseDocument(note).entries[0]; files.set(binding.target, note.slice(0, r.from) + note.slice(r.to));
@@ -115,4 +127,47 @@ test('capture preview survives native Modal selection bookkeeping', async () => 
   panel.onOpen();
   assert.equal(rendered.find(el => el.cls === 'hc-capture-preview').text, '触屏');
   assert.equal(rendered.find(el => el.text === '高亮并收录所选文字').disabled, false);
+});
+
+test('undo and restore preserve full note content, indexes and existing Canvas', async () => {
+  const { plugin, files, note } = setup();
+  const source = files.get(binding.source)!;
+  files.set('重点.canvas', buildCanvas(note, binding)); const canvas = files.get('重点.canvas');
+  await plugin.undoEntries(binding, [parseDocument(note).entries[0].id]);
+  assert.equal(parseDocument(await plugin.io.read(binding.target)).entries.length, 0);
+  assert(!files.get(binding.source)!.includes('==甲=='));
+  await plugin.restoreUndo();
+  assert.equal(files.get(binding.source), source); assert.equal(files.get(binding.target), note);
+  assert.equal(files.get('重点.canvas'), canvas); assert.equal(plugin.state.lastUndo, undefined);
+  await plugin.io.read(binding.target);
+});
+test('restoring an undo refuses to overwrite subsequent handwritten edits', async () => {
+  const { plugin, files, note } = setup();
+  await plugin.undoEntries(binding, [parseDocument(note).entries[0].id]);
+  const modified = files.get(binding.target)! + '\n新说明'; files.set(binding.target, modified);
+  await assert.rejects(plugin.restoreUndo(), /已有新修改/);
+  assert.equal(files.get(binding.target), modified);
+});
+test('undo retry accepts a completed target write whose updated index was not saved', async () => {
+  const { plugin, files, note } = setup();
+  const before = JSON.parse(JSON.stringify(plugin.state)); let saved: any;
+  plugin.saveData = async (state: any) => {
+    if (state.undoPending && parseDocument(files.get(binding.target)!).entries.length === 0) throw new Error('index disk');
+    saved = JSON.parse(JSON.stringify(state));
+  };
+  await assert.rejects(plugin.undoEntries(binding, [parseDocument(note).entries[0].id]), /index disk/);
+  assert.deepEqual(saved.indexes, before.indexes);
+  plugin.state = saved; plugin.saveData = async () => {};
+  await finishPending(plugin.state, plugin.io);
+  assert.equal(parseDocument(await plugin.io.read(binding.target)).entries.length, 0);
+  await plugin.restoreUndo(); assert.equal(files.get(binding.target), note);
+});
+test('rename after undo preserves the ability to restore at the new paths', async () => {
+  const { plugin, files, note } = setup();
+  await plugin.undoEntries(binding, [parseDocument(note).entries[0].id]);
+  files.set('新重点.md', files.get(binding.target)!); files.delete(binding.target);
+  await plugin.renamed(binding.target, '新重点.md');
+  await plugin.restoreUndo();
+  assert.equal(parseDocument(files.get('新重点.md')!).entries.length, 1);
+  assert.match(files.get(binding.source)!, /%E6%96%B0%E9%87%8D%E7%82%B9/);
 });

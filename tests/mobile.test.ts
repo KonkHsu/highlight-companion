@@ -2,8 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { build } from 'esbuild';
-import { snapshotSelection, selectionPreview } from '../src/selection';
+import { snapshotSelection, selectionPreview, readingSelection } from '../src/selection';
 import { uid, cloneData } from '../src/model';
+test('reading selection resolves within its section and rejects ambiguous or formatted matches', () => {
+  const source = '# 标题\n\n细胞膜。\n\n这里有==细胞膜==与结构。';
+  const selected = readingSelection(source, '细胞膜', 4, 4);
+  assert.equal(selected.from, source.lastIndexOf('细胞膜'));
+  assert.equal(source.slice(selected.from, selected.to), '细胞膜');
+  assert.throws(() => readingSelection('甲和甲', '甲', 0, 0), /无法唯一定位/);
+  assert.throws(() => readingSelection('**细胞**膜', '细胞膜', 0, 0), /无法唯一定位/);
+});
 test('selection snapshot is independent of later editor selection collapse', () => {
   let pos = { from: { line: 0, ch: 1 }, to: { line: 0, ch: 4 } };
   const editor = { getValue: () => '甲细胞膜乙', getCursor: (end: 'from' | 'to') => pos[end], posToOffset: (p: { ch: number }) => p.ch };

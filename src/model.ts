@@ -3,7 +3,8 @@ export interface Entry { id: string; text: string; chapter: string; sourceBlock:
 export interface Group { id: string; title: string; chapter: string }
 export interface Binding { id: string; source: string; target: string; canvas?: string }
 export interface Pending { binding: string; before: string; after: string; chapters: Chapter[]; entries: Entry[] }
-export interface State { version: 1; folder: string; bindings: Binding[]; pending?: Pending; indexes?: Record<string, string[]>; canvasLedgers?: Record<string, import('./canvas').CanvasLedger> }
+export interface UndoRecord { binding: string; sourceBefore: string; sourceAfter: string; targetBefore: string; targetAfter: string; count: number }
+export interface State { version: 1; folder: string; bindings: Binding[]; pending?: Pending; undoPending?: UndoRecord & { restoring?: boolean }; lastUndo?: UndoRecord; indexes?: Record<string, string[]>; canvasLedgers?: Record<string, import('./canvas').CanvasLedger> }
 export const emptyState = (): State => ({ version: 1, folder: '重点笔记', bindings: [] });
 export const uid = () => {
   // getRandomValues is available in mobile WebViews without randomUUID's secure-context requirement.

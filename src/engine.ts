@@ -1,4 +1,4 @@
-import { Binding, Pending, State } from './model';
+import { Binding, Pending, State, UndoRecord } from './model';
 import { appendEntries } from './document';
 export interface Storage {
   read(path: string): Promise<string>;
@@ -7,6 +7,7 @@ export interface Storage {
 }
 /** A persisted, idempotent two-file operation. Never undo or overwrite unrelated edits. */
 export async function finishPending(state: State, io: Storage) {
+  if (state.undoPending) { await finishUndo(state, io); }
   const p = state.pending;
   if (!p) return;
   const b = state.bindings.find(b => b.id === p.binding);
@@ -23,8 +24,32 @@ export async function finishPending(state: State, io: Storage) {
   state.pending = undefined;
   try { await io.save(); } catch (error) { state.pending = p; throw error; }
 }
+export async function commitUndo(state: State, io: Storage, record: UndoRecord, restoring = false) {
+  if (state.pending || state.undoPending) throw new Error('请先恢复上次未完成的操作。');
+  state.undoPending = { ...record, restoring };
+  try { await io.save(); } catch (error) { state.undoPending = undefined; throw error; }
+  await finishUndo(state, io);
+}
+async function finishUndo(state: State, io: Storage) {
+  const p = state.undoPending!;
+  const binding = state.bindings.find(b => b.id === p.binding);
+  if (!binding) throw new Error('待恢复撤销的课本绑定丢失。');
+  const check = (current: string, before: string, after: string) => {
+    if (current !== before && current !== after) throw new Error('撤销期间笔记已变化，已停止写入。请恢复操作前的笔记版本后重试。');
+    return after;
+  };
+  // Check both files before mutating either. A retry also accepts either completed side.
+  check(await io.read(binding.source), p.sourceBefore, p.sourceAfter);
+  check(await io.read(binding.target), p.targetBefore, p.targetAfter);
+  await io.change(binding.source, current => check(current, p.sourceBefore, p.sourceAfter));
+  await io.change(binding.target, current => check(current, p.targetBefore, p.targetAfter));
+  const previous = state.lastUndo;
+  state.lastUndo = p.restoring ? undefined : { binding: p.binding, sourceBefore: p.sourceBefore, sourceAfter: p.sourceAfter, targetBefore: p.targetBefore, targetAfter: p.targetAfter, count: p.count };
+  state.undoPending = undefined;
+  try { await io.save(); } catch (error) { state.undoPending = p; state.lastUndo = previous; throw error; }
+}
 export async function commitCapture(state: State, io: Storage, binding: Binding, operation: Omit<Pending, 'binding'>) {
-  if (state.pending) throw new Error('请先恢复上次未完成的收录。');
+  if (state.pending || state.undoPending) throw new Error('请先恢复上次未完成的操作。');
   state.pending = { binding: binding.id, ...operation };
   try { await io.save(); } catch (error) { state.pending = undefined; throw error; }
   await finishPending(state, io);

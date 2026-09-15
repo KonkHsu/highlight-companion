@@ -1,11 +1,12 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath, MarkdownRenderChild, Platform } from 'obsidian';
+import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath, MarkdownRenderChild, Platform, Menu } from 'obsidian';
 import { Binding, State, emptyState, uid, SerialQueue } from './model';
 import { capture } from './source';
 import { newDocument, parseDocument, appendEntries, arrange, renameGroup, dissolveGroup, entryText, groupTitle, rewriteBinding, rewriteLinks } from './document';
 import { buildCanvas, CanvasLedger } from './canvas';
-import { commitCapture, finishPending, Storage } from './engine';
+import { commitCapture, commitUndo, finishPending, Storage } from './engine';
+import { removeEntries, removeHighlights, selectedEntryIds } from './undo';
 import { hideInternalMarkers } from './editor';
-import { snapshotSelection, selectionPreview, SelectionSnapshot } from './selection';
+import { snapshotSelection, selectionPreview, SelectionSnapshot, readingSelection } from './selection';
 import { SelectionMemory, rememberEditorSelection } from './selection-memory';
 
 export default class HighlightCompanion extends Plugin {
@@ -26,6 +27,12 @@ export default class HighlightCompanion extends Plugin {
     this.addSettingTab(new Settings(this.app, this));
     this.addCommand({ id: 'bind-note', name: '绑定重点笔记', icon: 'link', callback: () => this.run(() => this.bindActive()) });
     this.addCommand({ id: 'highlight-collect', name: '高亮并收录', icon: 'highlighter', editorCallback: (editor, view) => { if (view.file) this.collect(view.file, editor); } });
+    this.addCommand({ id: 'undo-highlight', name: '撤销高亮并移除重点', icon: 'undo-2', callback: () => {
+      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+      if (view?.file && view.getMode() === 'source') this.undoSelection(view.file, view.editor);
+      else this.run(async () => this.showUndoPicker());
+    } });
+    this.addCommand({ id: 'restore-undo', name: '恢复上次撤销', icon: 'redo-2', callback: () => this.run(() => this.restoreUndo()) });
     this.addCommand({ id: 'capture-panel', name: '收录与整理面板', icon: 'panel-bottom', callback: () => this.showPanel() });
     this.addCommand({ id: 'import-highlights', name: '收录当前课本已有高亮', icon: 'list-plus', callback: () => this.run(() => this.importActive()) });
     this.addCommand({ id: 'open-note', name: '打开重点笔记', icon: 'notebook-pen', callback: () => this.run(async () => { const b = await this.contextBinding(); await this.open(b.target); }) });
@@ -38,6 +45,7 @@ export default class HighlightCompanion extends Plugin {
       if (!view.file || view.file.extension !== 'md') return;
       const file = view.file;
       menu.addItem(i => i.setTitle('高亮并收录').setIcon('highlighter').onClick(() => this.collect(file, editor)));
+      menu.addItem(i => i.setTitle('撤销高亮并移除重点').setIcon('undo-2').onClick(() => this.undoSelection(file, editor)));
       menu.addItem(i => i.setTitle('整理重点').setIcon('list-tree').onClick(() => this.run(async () => new OrganizeModal(this.app, this, await this.contextBinding()).open())));
     }));
     this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
@@ -45,6 +53,29 @@ export default class HighlightCompanion extends Plugin {
     }));
     this.registerEvent(this.app.workspace.on('layout-change', () => this.run(() => this.refreshCanvasLinks())));
     this.registerMarkdownPostProcessor((element, context) => {
+      const listener = new MarkdownRenderChild(element); context.addChild(listener);
+      listener.registerDomEvent(element, 'contextmenu', event => {
+        const selection = element.ownerDocument.defaultView?.getSelection();
+        if (!selection || selection.isCollapsed || !selection.rangeCount) return;
+        const range = selection.getRangeAt(0);
+        if (!element.contains(range.startContainer) || !element.contains(range.endContainer)) return;
+        const info = context.getSectionInfo(element), selectedText = selection.toString();
+        if (!info || !selectedText.trim()) return;
+        const file = this.app.vault.getAbstractFileByPath(context.sourcePath);
+        if (!(file instanceof TFile)) return;
+        event.preventDefault(); event.stopPropagation();
+        const act = (undo: boolean) => this.run(async () => {
+          const source = await this.read(file.path);
+          if (source !== info.text) throw new Error('笔记已变化，请重新选择文字。');
+          const snapshot = readingSelection(source, selectedText, info.lineStart, info.lineEnd);
+          if (undo) await this.undoSnapshot(file, snapshot);
+          else await this.collectSnapshot(file, snapshot);
+        });
+        const menu = new Menu();
+        menu.addItem(i => i.setTitle('高亮并收录').setIcon('highlighter').onClick(() => act(false)));
+        menu.addItem(i => i.setTitle('撤销高亮并移除重点').setIcon('undo-2').onClick(() => act(true)));
+        menu.showAtMouseEvent(event);
+      });
       const b = this.state.bindings.find(b => b.target === context.sourcePath);
       if (!b) return;
       // Only the document title section gets a toolbar, not every rendered paragraph.
@@ -54,10 +85,16 @@ export default class HighlightCompanion extends Plugin {
       const child = new MarkdownRenderChild(toolbar); context.addChild(child);
       const add = (name: string, fn: () => void) => { const button = toolbar.createEl('button', { text: name }); child.registerDomEvent(button, 'click', fn); };
       add('整理重点', () => new OrganizeModal(this.app, this, b).open());
+      add('撤销高亮与重点', () => new OrganizeModal(this.app, this, b).open());
       add('生成 / 增补导图', () => this.run(() => this.exportCanvas(b, false)));
       add('另存完整导图', () => this.run(() => this.exportCanvas(b, true)));
     });
-    this.app.workspace.onLayoutReady(() => this.run(async () => { await this.reconcile(); await finishPending(this.state, this.io); }));
+    this.app.workspace.onLayoutReady(() => this.run(async () => { await finishPending(this.state, this.io); await this.reconcile(); }));
+  }
+  showUndoPicker(file = this.app.workspace.getActiveFile()) {
+    const binding = this.state.bindings.find(b => b.source === file?.path || b.target === file?.path);
+    if (!binding) throw new Error('请打开已绑定的课本或重点笔记，再撤销收录。');
+    new OrganizeModal(this.app, this, binding).open();
   }
   showPanel() {
     const file = this.app.workspace.getActiveFile();
@@ -76,7 +113,9 @@ export default class HighlightCompanion extends Plugin {
     const parsed = parseDocument(text);
     if (parsed.binding.id !== binding.id) throw new Error('重点笔记绑定标识不匹配。');
     const expected = this.state.indexes?.[binding.id] ?? [];
-    if (expected.some(id => !parsed.regions.some(r => r.id === id))) throw new Error('收录区域被手动删除，已停止自动修改。请恢复原区域，避免丢失整理内容。');
+    const pending = this.state.undoPending;
+    const completedUndo = pending?.binding === binding.id && text === pending.targetAfter;
+    if (!completedUndo && expected.some(id => !parsed.regions.some(r => r.id === id))) throw new Error('收录区域被手动删除，已停止自动修改。请恢复原区域，避免丢失整理内容。');
   }
   async change(path: string, update: (text: string) => string) {
     const file = this.file(path), view = this.editor(path);
@@ -160,6 +199,40 @@ export default class HighlightCompanion extends Plugin {
   collect(file: TFile, editor: Editor) {
     const selection = this.selectionMemory.take(file.path, snapshotSelection(editor));
     this.run(() => this.collectSnapshot(file, selection));
+  }
+  undoSelection(file: TFile, editor: Editor) {
+    const selection = this.selectionMemory.take(file.path, snapshotSelection(editor));
+    this.run(() => this.undoSnapshot(file, selection));
+  }
+  async undoSnapshot(file: TFile, selection: SelectionSnapshot) {
+      await finishPending(this.state, this.io);
+      const b = this.state.bindings.find(b => b.source === file.path || b.target === file.path);
+      if (!b) throw new Error('这篇笔记尚未绑定重点笔记。');
+      if (await this.read(file.path) !== selection.source) throw new Error('笔记已变化，请重新选择后撤销。');
+      const parsed = parseDocument(await this.io.read(b.target));
+      const ids = file.path === b.target
+        ? parsed.entries.filter(e => selection.from === selection.to ? selection.from >= e.from && selection.from < e.to : selection.from < e.to && selection.to > e.from).map(e => e.id)
+        : selectedEntryIds(selection.source, parsed.entries.map(e => e.meta), selection.from, selection.to);
+      await this.undoEntries(b, ids);
+  }
+  async undoEntries(binding: Binding, ids: string[]) {
+    await finishPending(this.state, this.io);
+    if (!ids.length) throw new Error('请将光标放在已收录高亮内，或在“整理重点”中勾选要撤销的条目。');
+    const sourceBefore = await this.read(binding.source), targetBefore = await this.io.read(binding.target);
+    const removed = removeEntries(targetBefore, ids);
+    const sourceAfter = removeHighlights(sourceBefore, removed.entries);
+    await commitUndo(this.state, this.io, { binding: binding.id, sourceBefore, sourceAfter, targetBefore, targetAfter: removed.note, count: removed.entries.length });
+    new Notice(`已撤销 ${removed.entries.length} 条高亮与重点。误操作可执行“恢复上次撤销”；已有导图保持原样。`, 9000);
+  }
+  async restoreUndo() {
+    await finishPending(this.state, this.io);
+    const p = this.state.lastUndo;
+    if (!p) throw new Error('没有可恢复的撤销记录。');
+    const b = this.state.bindings.find(b => b.id === p.binding);
+    if (!b) throw new Error('对应课本绑定已丢失。');
+    if (await this.read(b.source) !== p.sourceAfter || await this.io.read(b.target) !== p.targetAfter) throw new Error('撤销后笔记已有新修改，无法直接恢复，以免覆盖修改。请通过文件恢复找回需要的内容。');
+    await commitUndo(this.state, this.io, { ...p, sourceBefore: p.sourceAfter, sourceAfter: p.sourceBefore, targetBefore: p.targetAfter, targetAfter: p.targetBefore }, true);
+    new Notice(`已恢复 ${p.count} 条高亮与重点。`);
   }
   async collectSnapshot(file: TFile, selection: SelectionSnapshot) {
       const { source: snapshot, from, to } = selection;
@@ -249,6 +322,12 @@ export default class HighlightCompanion extends Plugin {
     for (const b of this.state.bindings) {
       const old = { ...b }; b.source = remap(b.source); b.target = remap(b.target); if (b.canvas) b.canvas = remap(b.canvas);
       if (old.source === b.source && old.target === b.target && old.canvas === b.canvas) continue;
+      for (const record of [this.state.undoPending, this.state.lastUndo]) if (record?.binding === b.id) {
+        record.sourceBefore = rewriteLinks(record.sourceBefore, old.target, b.target);
+        record.sourceAfter = rewriteLinks(record.sourceAfter, old.target, b.target);
+        record.targetBefore = rewriteBinding(rewriteLinks(record.targetBefore, old.source, b.source), b);
+        record.targetAfter = rewriteBinding(rewriteLinks(record.targetAfter, old.source, b.source), b);
+      }
       await this.io.save();
       if (this.state.pending?.binding === b.id) {
         this.state.pending.before = rewriteLinks(this.state.pending.before, old.target, b.target);
@@ -300,6 +379,8 @@ export class CapturePanel extends Modal {
     };
     add('高亮并收录所选文字', () => this.plugin.collectSnapshot(this.file, this.capturedSelection!), !!preview, true);
     add('收录已有高亮', () => this.plugin.importActive(this.file), isSource);
+    add('撤销高亮与重点', async () => this.plugin.showUndoPicker(this.file), this.plugin.state.bindings.some(b => b.source === this.file.path || b.target === this.file.path));
+    add('恢复上次撤销', () => this.plugin.restoreUndo(), !!this.plugin.state.lastUndo);
     add('打开重点笔记', async () => this.plugin.open((await this.plugin.contextBinding(this.file)).target));
     add('整理关键词', async () => new OrganizeModal(this.app, this.plugin, await this.plugin.contextBinding(this.file)).open());
     add('生成 / 增补导图', async () => this.plugin.exportCanvas(await this.plugin.contextBinding(this.file), false));
@@ -386,6 +467,18 @@ export class OrganizeModal extends Modal {
     button('移出重点', (t, ids) => arrange(t, ids, { type: 'remove' }));
     button('重命名重点', (t, _ids, title, group) => renameGroup(t, group, title));
     button('解散重点', (t, _ids, _title, group) => dissolveGroup(t, group));
+    const undo = controls.createEl('button', { text: '撤销所选高亮与重点' });
+    undo.onclick = () => {
+      if (this.busy) return;
+      this.busy = true;
+      const ids = [...this.selected];
+      controls.querySelectorAll('button').forEach(b => b.disabled = true);
+      this.plugin.run(async () => {
+        try { await this.plugin.undoEntries(this.binding, ids); this.selected.clear(); await this.render(); }
+        finally { this.busy = false; controls.querySelectorAll('button').forEach(b => b.disabled = false); }
+      });
+    };
+    this.contentEl.createEl('p', { cls: 'hc-subtitle', text: '撤销会同时取消原文高亮并移除所选条目（含条目内说明）；分组说明与已有导图保留。可用“恢复上次撤销”找回最近一次，需在继续编辑前执行。' });
     const count = this.contentEl.createEl('p', { cls: 'hc-selection', text: `已选择 ${this.selected.size} 个关键词` });
     count.setAttribute('role', 'status'); count.setAttribute('aria-live', 'polite');
     if (!parsed.entries.length) this.contentEl.createEl('p', { text: '还没有收录内容。请回到课本选择文字，使用“高亮并收录”。' });

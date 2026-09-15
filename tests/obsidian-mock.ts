@@ -12,5 +12,6 @@ export class MarkdownRenderChild { constructor(..._args: any[]) {} }
 export class Modal { constructor(..._args: any[]) {} }
 export class Setting { constructor(..._args: any[]) {} }
 export class Notice { constructor(..._args: any[]) {} }
+export class Menu {}
 export const normalizePath = (value: string) => value.replace(/\\/g, '/');
 export type Editor = any;
