@@ -99,6 +99,28 @@ test('incremental Canvas preserves edits, deletion, custom nodes and connection 
   assert.equal(buildCanvas(note, binding, JSON.stringify(after)), JSON.stringify(after, null, 2));
   const fresh = JSON.parse(buildCanvas(note, binding)); assert(fresh.nodes.length > 0);
 });
+test('grouping creates a parent branch for existing keywords and remains idempotent', () => {
+  const { note, captured } = collect('# 章节\n\n==甲==和==乙==');
+  const before = JSON.parse(buildCanvas(note, binding));
+  // Exercise migration from an earlier release too.
+  delete before.highlightCompanion.parents; delete before.highlightCompanion.branchEdges;
+  before.nodes[0].text = '手动标题';
+  const grouped = arrange(note, captured.entries.map(e => e.id), { type: 'create', title: '共同重点' });
+  const group = parseDocument(grouped).groups[0];
+  const after = JSON.parse(buildCanvas(grouped, binding, JSON.stringify(before)));
+  const groupId = after.highlightCompanion.exported['g-' + group.id];
+  assert(after.nodes.find((n: any) => n.id === groupId).text.includes('共同重点'));
+  assert.deepEqual(after.nodes.slice(0, before.nodes.length), before.nodes);
+  for (const entry of captured.entries) {
+    const nodeId = after.highlightCompanion.exported['e-' + entry.id];
+    const incoming = after.edges.filter((e: any) => e.toNode === nodeId);
+    assert.equal(incoming.length, 1); assert.equal(incoming[0].fromNode, groupId);
+  }
+  assert.equal(buildCanvas(grouped, binding, JSON.stringify(after)), JSON.stringify(after, null, 2));
+  const fresh = JSON.parse(buildCanvas(grouped, binding));
+  const parentId = fresh.highlightCompanion.exported['g-' + group.id];
+  assert.equal(fresh.edges.filter((e: any) => e.fromNode === parentId).length, 2);
+});
 test('rename only changes generated links and supports special path characters', () => {
   const text = '[返回原文](<%E8%AF%BE%E6%9C%AC/a%23b.md#^block>) [其他](<keep>)';
   assert.equal(rewriteLinks(text, '课本/a#b.md', '新目录/a b.md'), '[返回原文](<%E6%96%B0%E7%9B%AE%E5%BD%95/a%20b.md#^block>) [其他](<keep>)');

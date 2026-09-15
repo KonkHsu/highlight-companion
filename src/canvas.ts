@@ -3,7 +3,7 @@ import { parseDocument, entryText, groupTitle } from './document';
 export interface CanvasNode { id: string; type: string; x: number; y: number; width: number; height: number; text?: string; [key: string]: unknown }
 export interface CanvasData { nodes: CanvasNode[]; edges: { id: string; fromNode: string; toNode: string; [key: string]: unknown }[]; [key: string]: unknown }
 interface Desired { key: string; parent?: string; text: string; depth: number }
-export interface CanvasLedger { binding: string; exported: Record<string, string>; target?: string }
+export interface CanvasLedger { binding: string; exported: Record<string, string>; target?: string; parents?: Record<string, string>; branchEdges?: Record<string, string> }
 export function buildCanvas(note: string, binding: Binding, previous?: string, savedLedger?: CanvasLedger): string {
   const parsed = parseDocument(note);
   let canvas: CanvasData = { nodes: [], edges: [] };
@@ -15,6 +15,18 @@ export function buildCanvas(note: string, binding: Binding, previous?: string, s
   // Persist tombstones in the Canvas itself: deleted cards stay deleted on incremental export.
   const metadata = cloneData(savedLedger ?? canvas.highlightCompanion ?? { binding: binding.id, exported: {} }) as CanvasLedger;
   if (!metadata.exported || typeof metadata.exported !== 'object') throw new Error('导图导出记录损坏。');
+  metadata.parents ??= {};
+  metadata.branchEdges ??= {};
+  // Older exports have no edge ledger. Adopt only an unambiguous standard branch.
+  const keys = new Map(Object.entries(metadata.exported).map(([key, id]) => [id, key]));
+  for (const [key, id] of Object.entries(metadata.exported)) {
+    if (metadata.parents[key]) continue;
+    const incoming = canvas.edges.filter(edge => edge.toNode === id && keys.has(edge.fromNode) && edge.fromSide === 'right' && edge.toSide === 'left' && edge.toEnd === 'arrow');
+    if (incoming.length === 1) {
+      metadata.parents[key] = keys.get(incoming[0].fromNode)!;
+      metadata.branchEdges[key] = incoming[0].id;
+    }
+  }
   const desired: Desired[] = [{ key: 'book', text: `# ${binding.source.split('/').at(-1)!.replace(/\.md$/, '')}\n\n${link(binding.target, undefined, '打开重点笔记')}`, depth: 0 }];
   for (const c of parsed.chapters) desired.push({ key: 'c-' + c.id, parent: c.meta.parents.length ? 'c-' + c.meta.parents.at(-1) : 'book', text: c.meta.title, depth: c.meta.parents.length + 1 });
   for (const c of parsed.chapters) {
@@ -47,7 +59,31 @@ export function buildCanvas(note: string, binding: Binding, previous?: string, s
     let parentKey = item.parent;
     // If the user deleted a parent, attach new content to the nearest surviving ancestor.
     while (parentKey && !existingIds.has(metadata.exported[parentKey])) parentKey = desired.find(d => d.key === parentKey)?.parent;
-    if (parentKey) canvas.edges.push({ id: uid(), fromNode: metadata.exported[parentKey], toNode: id, fromSide: 'right', toSide: 'left', toEnd: 'arrow' });
+    if (parentKey) {
+      const edgeId = uid();
+      canvas.edges.push({ id: edgeId, fromNode: metadata.exported[parentKey], toNode: id, fromSide: 'right', toSide: 'left', toEnd: 'arrow' });
+      metadata.parents[item.key] = item.parent!;
+      metadata.branchEdges[item.key] = edgeId;
+    }
+  }
+  // Regrouped keywords already exist: update their branch without replacing cards.
+  for (const item of desired.filter(item => item.key.startsWith('e-'))) {
+    const id = metadata.exported[item.key], parent = item.parent!;
+    if (!existingIds.has(id) || !existingIds.has(metadata.exported[parent])) continue;
+    if (metadata.parents[item.key] === parent) continue;
+    if (!metadata.parents[item.key] && !parent.startsWith('g-')) {
+      metadata.parents[item.key] = parent;
+      continue;
+    }
+    const old = canvas.edges.find(edge => edge.id === metadata.branchEdges![item.key]);
+    if (old && old.toNode === id && old.fromNode === metadata.exported[metadata.parents[item.key]]) {
+      old.fromNode = metadata.exported[parent];
+    } else {
+      const edgeId = uid();
+      canvas.edges.push({ id: edgeId, fromNode: metadata.exported[parent], toNode: id, fromSide: 'right', toSide: 'left', toEnd: 'arrow' });
+      metadata.branchEdges[item.key] = edgeId;
+    }
+    metadata.parents[item.key] = parent;
   }
   canvas.highlightCompanion = metadata;
   return JSON.stringify(canvas, null, 2);
