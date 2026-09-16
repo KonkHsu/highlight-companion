@@ -3,8 +3,8 @@ import { parseDocument, entryText, groupTitle } from './document';
 export interface CanvasNode { id: string; type: string; x: number; y: number; width: number; height: number; text?: string; [key: string]: unknown }
 export interface CanvasData { nodes: CanvasNode[]; edges: { id: string; fromNode: string; toNode: string; [key: string]: unknown }[]; [key: string]: unknown }
 interface Desired { key: string; parent?: string; text: string; depth: number }
-export interface CanvasLedger { binding: string; exported: Record<string, string>; target?: string; parents?: Record<string, string>; branchEdges?: Record<string, string> }
-export function buildCanvas(note: string, binding: Binding, previous?: string, savedLedger?: CanvasLedger): string {
+export interface CanvasLedger { binding: string; exported: Record<string, string>; target?: string; parents?: Record<string, string>; branchEdges?: Record<string, string>; selection?: string[] }
+export function buildCanvas(note: string, binding: Binding, previous?: string, savedLedger?: CanvasLedger, selection?: string[]): string {
   const parsed = parseDocument(note);
   let canvas: CanvasData = { nodes: [], edges: [] };
   if (previous) {
@@ -27,7 +27,7 @@ export function buildCanvas(note: string, binding: Binding, previous?: string, s
       metadata.branchEdges[key] = incoming[0].id;
     }
   }
-  const desired: Desired[] = [{ key: 'book', text: `# ${binding.source.split('/').at(-1)!.replace(/\.md$/, '')}\n\n${link(binding.target, undefined, '打开重点笔记')}`, depth: 0 }];
+  let desired: Desired[] = [{ key: 'book', text: `# ${binding.source.split('/').at(-1)!.replace(/\.md$/, '')}\n\n${link(binding.target, undefined, '打开重点笔记')}`, depth: 0 }];
   for (const c of parsed.chapters) desired.push({ key: 'c-' + c.id, parent: c.meta.parents.length ? 'c-' + c.meta.parents.at(-1) : 'book', text: c.meta.title, depth: c.meta.parents.length + 1 });
   for (const c of parsed.chapters) {
     for (const item of c.children) {
@@ -38,6 +38,18 @@ export function buildCanvas(note: string, binding: Binding, previous?: string, s
       const entries = item.kind === 'group' ? item.children : [item];
       for (const e of entries) if (e.kind === 'entry') desired.push({ key: 'e-' + e.id, parent: item.kind === 'group' ? 'g-' + item.id : 'c-' + c.id, text: `${entryText(note, e)}\n\n${link(binding.target, 'hc-' + e.id, '查看重点')}`, depth: c.meta.parents.length + (item.kind === 'group' ? 3 : 2) });
     }
+  }
+  const chosen = selection ?? metadata.selection;
+  if (chosen) {
+    if (!chosen.length || (!previous && chosen.some(key => !desired.some(d => d.key === key && /^[eg]-/.test(key))))) throw new Error('请勾选有效的重点或关键词。');
+    const keep = new Set<string>(['book']);
+    for (const item of desired) {
+      if (!chosen.includes(item.key) && !(item.parent?.startsWith('g-') && chosen.includes(item.parent))) continue;
+      let node: Desired | undefined = item;
+      while (node && !keep.has(node.key)) { keep.add(node.key); node = desired.find(d => d.key === node!.parent); }
+    }
+    desired = desired.filter(d => keep.has(d.key));
+    metadata.selection = [...chosen];
   }
   const heightFor = (item: Desired) => Math.max(120, Math.min(600, 60 + Math.ceil(item.text.replace(/\]\(<[^>]+>\)/g, ']').length / 20) * 24));
   const layout = new Map<string, number>();

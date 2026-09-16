@@ -1,12 +1,98 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { capture } from '../src/source';
-import { newDocument, appendEntries, parseDocument, arrange, renameGroup, dissolveGroup, entryText, rewriteLinks } from '../src/document';
+import { newDocument, appendEntries, parseDocument, arrange, renameGroup, dissolveGroup, entryText, rewriteLinks, addManualGroup, addCustomEntry, setExamTypes, migrateGroupDisplays } from '../src/document';
 import { buildCanvas } from '../src/canvas';
 import { Binding, emptyState, SerialQueue } from '../src/model';
 import { commitCapture, finishPending, Storage } from '../src/engine';
 const binding: Binding = { id: 'book1', source: '课本/生物.md', target: '重点/生物.md' };
 function collect(source: string) { const captured = capture(source, binding.target); return { captured, note: appendEntries(newDocument(binding, '生物'), binding, captured.chapters, captured.entries) }; }
+
+test('custom keywords persist without source links, validate input and support empty notes', () => {
+  const blank = newDocument(binding, '生物');
+  assert.throws(() => addCustomEntry(blank, '', ' \n '), /请输入/);
+  assert.throws(() => addCustomEntry(blank, 'missing', '甲'), /章节/);
+  const first = addCustomEntry(blank, '', '  细胞膜  ');
+  const second = addCustomEntry(first.note, first.entry.chapter, '细胞膜');
+  const parsed = parseDocument(second.note);
+  assert.equal(parsed.chapters.length, 1);
+  assert.equal(parsed.entries.length, 2);
+  assert.notEqual(first.entry.id, second.entry.id);
+  assert.equal(parsed.entries[0].meta.origin, 'custom');
+  assert.equal(entryText(second.note, parsed.entries[0]), '细胞膜');
+  assert(!second.note.includes('[返回原文]'));
+  assert.throws(() => addCustomEntry(second.note, first.entry.chapter, '<!--hc:entry:bad-->'), /内部区域标识/);
+});
+
+test('custom and captured keywords share grouping, selected maps and incremental maps', () => {
+  const { note, captured } = collect('# 第一章\n\n==甲==');
+  const custom = addCustomEntry(note, captured.entries[0].chapter, '自定义乙');
+  const grouped = arrange(custom.note, [captured.entries[0].id, custom.entry.id], { type: 'create', title: '同等重点' });
+  const group = parseDocument(grouped).groups[0];
+  assert.equal(group.children.length, 2);
+  const selected = JSON.parse(buildCanvas(grouped, binding, undefined, undefined, ['e-' + custom.entry.id]));
+  assert(selected.highlightCompanion.exported['e-' + custom.entry.id]);
+  assert(!selected.highlightCompanion.exported['e-' + captured.entries[0].id]);
+  const first = buildCanvas(grouped, binding, undefined, undefined, ['g-' + group.id]);
+  const next = addCustomEntry(grouped, custom.entry.chapter, '自定义丙');
+  const joined = arrange(next.note, [next.entry.id], { type: 'add', group: group.id });
+  const updated = JSON.parse(buildCanvas(joined, binding, first));
+  assert(updated.highlightCompanion.exported['e-' + next.entry.id]);
+  const detached = arrange(joined, [custom.entry.id], { type: 'remove' });
+  assert.equal(parseDocument(detached).entries.find(e => e.id === custom.entry.id)?.parent?.kind, 'chapter');
+  assert.equal(parseDocument(dissolveGroup(detached, group.id)).entries.length, 3);
+});
+
+test('handwritten points preserve Markdown, classify independently and export without source highlights', () => {
+  const note = addManualGroup(newDocument(binding, '生物'), '', '手写说明', '第一段\n\n- **第二段**', ['简答', '论述']);
+  const parsed = parseDocument(note), group = parsed.groups[0];
+  assert.equal(parsed.entries.length, 0);
+  assert.deepEqual(group.meta.examTypes, ['简答', '论述']);
+  assert.match(note, /第一段\n\n- \*\*第二段\*\*/);
+  assert(!note.includes('[返回原文]'));
+  const edited = note.replace('第一段', '笔记中直接修改后的正文');
+  const classified = setExamTypes(edited, group.id, ['选择', '名词解释']);
+  assert.match(classified, /笔记中直接修改后的正文/);
+  assert.match(classified, /\*\*重点：手写说明（名词解释、选择）\*\*/);
+  assert.deepEqual(parseDocument(classified).groups[0].meta.examTypes, ['名词解释', '选择']);
+  const canvas = JSON.parse(buildCanvas(classified, binding));
+  assert(canvas.nodes.some((n: any) => n.text.includes('笔记中直接修改后的正文') && n.text.includes('名词解释、选择')));
+  const cleared = setExamTypes(classified, group.id, []);
+  assert.match(cleared, /\*\*重点：手写说明\*\*/);
+  assert.equal((cleared.match(/考试题型：/g) ?? []).length, 0);
+  const legacy = classified.replace('**重点：手写说明（名词解释、选择）**', '**重点：手写说明**\n\n考试题型：名词解释、选择');
+  const migrated = migrateGroupDisplays(legacy);
+  assert.match(migrated, /\*\*重点：手写说明（名词解释、选择）\*\*/);
+  assert.equal((migrated.match(/考试题型：/g) ?? []).length, 0);
+  assert.throws(() => addManualGroup(note, 'missing', '标题', '内容'), /章节/);
+  assert.throws(() => addManualGroup(note, '', '标题', '<!--hc:book:bad-->'), /内部区域标识/);
+});
+
+test('classifying collected groups retains keywords and handwritten explanations', () => {
+  const { note, captured } = collect('# 章节\n\n==甲==和==乙==');
+  const grouped = arrange(note, captured.entries.map(e => e.id), { type: 'create', title: '重点' });
+  const group = parseDocument(grouped).groups[0];
+  const classified = setExamTypes(grouped, group.id, ['名词解释', '选择', '简答', '论述']);
+  assert.equal(parseDocument(classified).entries.length, 2);
+  assert.deepEqual(parseDocument(classified).groups[0].meta.examTypes, ['名词解释', '选择', '简答', '论述']);
+});
+
+test('selected maps keep ancestors, omit sibling keywords, and retain scope when supplemented', () => {
+  const { note, captured } = collect('# 第一章\n\n## 小节\n\n==甲==和==乙==\n\n# 第二章\n\n==丙==');
+  const grouped = arrange(note, captured.entries.slice(0, 2).map(e => e.id), { type: 'create', title: '共同重点' });
+  const group = parseDocument(grouped).groups[0];
+  const key = 'e-' + captured.entries[0].id;
+  const partial = JSON.parse(buildCanvas(grouped, binding, undefined, undefined, [key]));
+  assert.equal(partial.nodes.length, 5); // book, ancestor chapter, subsection, group, selected keyword
+  assert(!partial.highlightCompanion.exported['e-' + captured.entries[1].id]);
+  assert(!partial.highlightCompanion.exported['e-' + captured.entries[2].id]);
+  const updated = JSON.parse(buildCanvas(grouped, binding, JSON.stringify(partial)));
+  assert.deepEqual(updated, partial);
+  const mixed = JSON.parse(buildCanvas(grouped, binding, undefined, undefined, ['g-' + group.id, 'e-' + captured.entries[2].id]));
+  captured.entries.forEach(e => assert(mixed.highlightCompanion.exported['e-' + e.id]));
+  assert.throws(() => buildCanvas(grouped, binding, undefined, undefined, []), /勾选/);
+  assert.throws(() => buildCanvas(grouped, binding, undefined, undefined, ['g-missing']), /勾选/);
+});
 
 test('imports by chapter, skips code and links, preserves identical words at distinct locations', () => {
   const { captured, note } = collect('==前言==\n\n# 第一章\n\n==细胞==和==结构==。\n\n## 特点\n\n==细胞==\n\n# 第二章\n\n## 特点\n\n==膜==\n\n```txt\n==不收录==\n```\n\n`==代码==` 与 [==链接==](url)');

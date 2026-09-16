@@ -1,6 +1,8 @@
 export interface Chapter { id: string; title: string; depth: number; parents: string[] }
-export interface Entry { id: string; text: string; chapter: string; sourceBlock: string; created: string }
-export interface Group { id: string; title: string; chapter: string }
+export interface Entry { id: string; text: string; chapter: string; sourceBlock: string; created: string; origin?: 'custom' }
+export const examTypes = ['名词解释', '选择', '简答', '论述'] as const;
+export type ExamType = typeof examTypes[number];
+export interface Group { id: string; title: string; chapter: string; examTypes?: ExamType[] }
 export interface Binding { id: string; source: string; target: string; canvas?: string }
 export interface Pending { binding: string; before: string; after: string; chapters: Chapter[]; entries: Entry[] }
 export interface UndoRecord { binding: string; sourceBefore: string; sourceAfter: string; targetBefore: string; targetAfter: string; count: number }

@@ -3,13 +3,57 @@ import assert from 'node:assert/strict';
 import { build } from 'esbuild';
 import path from 'node:path';
 import { capture } from '../src/source';
-import { newDocument, appendEntries, parseDocument } from '../src/document';
+import { newDocument, appendEntries, parseDocument, addCustomEntry } from '../src/document';
 import { buildCanvas } from '../src/canvas';
 import { Binding } from '../src/model';
 import { finishPending } from '../src/engine';
 const bundle = await build({ entryPoints: ['tests/adapter-harness.ts'], bundle: true, write: false, platform: 'node', format: 'esm', alias: { obsidian: path.resolve('tests/obsidian-mock.ts') } });
 const { HighlightCompanion, TFile, MarkdownView } = await import('data:text/javascript;base64,' + Buffer.from(bundle.outputFiles[0].text).toString('base64'));
 const binding: Binding = { id: 'book', source: '课本.md', target: '重点.md', canvas: '重点.canvas' };
+test('mobile editor actions wait for release, suppress the sheet and use the final selection', async () => {
+  const oldDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const timers = new Map<number, () => void>(); let timerId = 0;
+  const bars: any[] = [], listeners = new Map<string, (event: any) => void>();
+  const doc = {
+    body: { classList: { contains: () => true }, createDiv: () => {
+      const bar: any = { buttons: [], style: {}, removed: false, classList: { toggle() {} }, setAttribute() {}, contains: (target: any) => bar.buttons.includes(target), remove: () => bar.removed = true, getBoundingClientRect: () => ({ width: 200 }), createEl: (_tag: string, options: any) => { const button = { ...options }; bar.buttons.push(button); return button; } };
+      bars.push(bar); return bar;
+    } },
+    getSelection: () => ({ rangeCount: 1, anchorNode: {}, getRangeAt: () => ({ getBoundingClientRect: () => ({ left: 40, top: 200, bottom: 225, width: 90, height: 25 }) }) })
+  };
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: doc });
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { innerWidth: 320, setTimeout: (fn: () => void) => { timers.set(++timerId, fn); return timerId; }, clearTimeout: (id: number) => timers.delete(id) } });
+  try {
+    const plugin = new HighlightCompanion(), view = new MarkdownView();
+    let to = 1, cleanup = () => {}, captured: any;
+    view.file = new TFile('课本.md'); view.containerEl = { contains: () => true };
+    view.editor = { getValue: () => '甲乙丙', getCursor: (side: string) => ({ ch: side === 'from' ? 0 : to }), posToOffset: (pos: any) => pos.ch };
+    plugin.app = { workspace: { getActiveViewOfType: () => view } };
+    plugin.registerDomEvent = (_target: any, event: string, fn: any) => listeners.set(event, fn);
+    plugin.register = (fn: any) => cleanup = fn;
+    plugin.collectSnapshot = async (_file: any, snapshot: any) => captured = snapshot;
+    plugin.registerMobileEditorActions();
+    const fire = (name: string, event: any = {}) => listeners.get(name)!(event);
+    const flush = () => { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); };
+    fire('touchstart'); fire('selectionchange'); flush(); assert.equal(bars.length, 0);
+    let prevented = false, stopped = false;
+    fire('contextmenu', { target: {}, preventDefault: () => prevented = true, stopImmediatePropagation: () => stopped = true });
+    assert(prevented && stopped); flush(); assert.equal(bars.length, 0);
+    to = 3; fire('selectionchange'); fire('touchend'); flush();
+    assert.equal(bars.length, 1);
+    assert.deepEqual(bars[0].buttons.map((b: any) => b.text), ['高亮并收录', '撤销高亮并移除重点']);
+    fire('pointerdown', { target: bars[0].buttons[0] });
+    assert(!bars[0].removed);
+    bars[0].buttons[0].onclick(); await plugin.queue.run(async () => {});
+    assert.equal(captured.to, 3); assert.equal(captured.source, '甲乙丙');
+    fire('touchstart'); fire('selectionchange'); cleanup(); flush();
+    assert.equal(bars.length, 1);
+  } finally {
+    if (oldDocument) Object.defineProperty(globalThis, 'document', oldDocument); else delete (globalThis as any).document;
+    if (oldWindow) Object.defineProperty(globalThis, 'window', oldWindow); else delete (globalThis as any).window;
+  }
+});
 function setup() {
   const result = capture('# 章\n\n==甲==', binding.target);
   const note = appendEntries(newDocument(binding, '课本'), binding, result.chapters, result.entries);
@@ -21,6 +65,22 @@ function setup() {
   plugin.saveData = async () => {};
   return { plugin, files, note, setLeaves: (value: any[]) => leaves = value };
 }
+test('custom-only and mixed removal restore exactly through the normal adapter journal', async () => {
+  for (const mixed of [false, true]) {
+    const { plugin, files, note } = setup();
+    const captured = parseDocument(note).entries[0];
+    const added = addCustomEntry(note, captured.meta.chapter, '甲');
+    await plugin.change(binding.target, () => added.note);
+    const before = files.get(binding.source);
+    await plugin.undoEntries(binding, mixed ? [added.entry.id, captured.id] : [added.entry.id]);
+    assert.equal(parseDocument(files.get(binding.target)!).entries.length, mixed ? 0 : 1);
+    if (!mixed) assert.equal(files.get(binding.source), before);
+    else assert(!files.get(binding.source)!.includes(`<!--hc-h:${captured.id}-->`));
+    await plugin.restoreUndo();
+    assert.equal(files.get(binding.source), before);
+    assert.equal(files.get(binding.target), added.note);
+  }
+});
 test('reading-view snapshots support collection, undo, and stale-selection protection', async () => {
   const { plugin, files } = setup();
   const file = new TFile(binding.source), source = files.get(binding.source)!;
@@ -155,7 +215,7 @@ test('capture preview survives native Modal selection bookkeeping', async () => 
   const { CapturePanel } = await import('data:text/javascript;base64,' + Buffer.from(bundle.outputFiles[0].text).toString('base64'));
   const { plugin } = setup();
   const rendered: any[] = [];
-  const element: any = { createEl: (_tag: string, options: any) => { const el = { ...options }; rendered.push(el); return el; }, createDiv: () => element };
+  const element: any = { createEl: (_tag: string, options: any) => { const el = { ...options, createEl: element.createEl }; rendered.push(el); return el; }, createDiv: () => element };
   const panel = new CapturePanel(plugin.app, plugin, new TFile(binding.source), { source: '触屏选择', from: 0, to: 2 });
   panel.modalEl = { addClass() {} }; panel.contentEl = element; panel.setTitle = () => {};
   // Obsidian Modal owns this property and may replace it when opening.

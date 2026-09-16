@@ -1,7 +1,7 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, normalizePath, MarkdownRenderChild, Platform, Menu } from 'obsidian';
-import { Binding, State, emptyState, uid, SerialQueue } from './model';
+import { Binding, State, emptyState, uid, SerialQueue, ExamType, examTypes } from './model';
 import { capture } from './source';
-import { newDocument, parseDocument, appendEntries, arrange, renameGroup, dissolveGroup, entryText, groupTitle, rewriteBinding, rewriteLinks } from './document';
+import { newDocument, parseDocument, appendEntries, arrange, renameGroup, dissolveGroup, entryText, groupTitle, rewriteBinding, rewriteLinks, addManualGroup, addCustomEntry, setExamTypes, migrateGroupDisplays } from './document';
 import { buildCanvas, CanvasLedger } from './canvas';
 import { commitCapture, commitUndo, finishPending, Storage } from './engine';
 import { removeEntries, removeHighlights, selectedEntryIds } from './undo';
@@ -37,6 +37,8 @@ export default class HighlightCompanion extends Plugin {
     this.addCommand({ id: 'import-highlights', name: '收录当前课本已有高亮', icon: 'list-plus', callback: () => this.run(() => this.importActive()) });
     this.addCommand({ id: 'open-note', name: '打开重点笔记', icon: 'notebook-pen', callback: () => this.run(async () => { const b = await this.contextBinding(); await this.open(b.target); }) });
     this.addCommand({ id: 'organize', name: '整理重点', icon: 'list-tree', callback: () => this.run(async () => { const b = await this.contextBinding(); new OrganizeModal(this.app, this, b).open(); }) });
+    this.addCommand({ id: 'manual-point', name: '手动增加重点', callback: () => this.run(async () => new ManualGroupModal(this.app, this, await this.contextBinding()).open()) });
+    this.addCommand({ id: 'canvas-selected', name: '勾选内容创建导图', callback: () => this.run(async () => new CanvasSelectionModal(this.app, this, await this.contextBinding()).open()) });
     this.addCommand({ id: 'canvas-update', name: '生成或增补思维导图', icon: 'git-fork', callback: () => this.run(async () => this.chooseCanvas(await this.contextBinding())) });
     this.addCommand({ id: 'canvas-new', name: '另存完整思维导图', icon: 'copy-plus', callback: () => this.run(async () => this.exportCanvas(await this.contextBinding(), true)) });
     this.addCommand({ id: 'recover', name: '恢复未完成收录并检查绑定', icon: 'refresh-cw', callback: () => this.run(async () => { await finishPending(this.state, this.io); await this.reconcile(true); new Notice('恢复与检查完成。'); }) });
@@ -44,6 +46,7 @@ export default class HighlightCompanion extends Plugin {
     this.registerEvent(this.app.workspace.on('editor-menu', (menu, editor, view) => {
       if (!view.file || view.file.extension !== 'md') return;
       const file = view.file;
+      if (Platform.isMobileApp || document.body.classList.contains('is-mobile')) return;
       menu.addItem(i => i.setTitle('高亮并收录').setIcon('highlighter').onClick(() => this.collect(file, editor)));
       menu.addItem(i => i.setTitle('撤销高亮并移除重点').setIcon('undo-2').onClick(() => this.undoSelection(file, editor)));
       menu.addItem(i => i.setTitle('整理重点').setIcon('list-tree').onClick(() => this.run(async () => new OrganizeModal(this.app, this, await this.contextBinding()).open())));
@@ -57,6 +60,7 @@ export default class HighlightCompanion extends Plugin {
       type ReadingPick = { text: string; info: ReturnType<typeof context.getSectionInfo>; range: Range; file: TFile };
       let mobileActions: HTMLElement | undefined;
       let selectionTimer: number | undefined;
+      let dragging = false;
       const clearMobileActions = () => { mobileActions?.remove(); mobileActions = undefined; };
       const readingPick = (): ReadingPick | undefined => {
         const selection = element.ownerDocument.defaultView?.getSelection();
@@ -78,6 +82,9 @@ export default class HighlightCompanion extends Plugin {
           else await this.collectSnapshot(pick.file, snapshot);
       });
       listener.registerDomEvent(element, 'contextmenu', event => {
+        if (Platform.isMobileApp || element.ownerDocument.body.classList.contains('is-mobile')) {
+          event.preventDefault(); event.stopImmediatePropagation(); scheduleMobileActions(); return;
+        }
         const pick = readingPick();
         if (!pick) return;
         event.preventDefault(); event.stopPropagation(); clearMobileActions();
@@ -85,12 +92,13 @@ export default class HighlightCompanion extends Plugin {
         menu.addItem(i => i.setTitle('高亮并收录').setIcon('highlighter').onClick(() => act(pick, false)));
         menu.addItem(i => i.setTitle('撤销高亮并移除重点').setIcon('undo-2').onClick(() => act(pick, true)));
         menu.showAtMouseEvent(event);
-      });
+      }, true);
       const scheduleMobileActions = () => {
         if (!Platform.isMobileApp && !element.ownerDocument.body.classList.contains('is-mobile')) return;
         clearMobileActions();
         if (selectionTimer !== undefined) element.ownerDocument.defaultView?.clearTimeout(selectionTimer);
         selectionTimer = element.ownerDocument.defaultView?.setTimeout(() => {
+          if (dragging) return;
           const pick = readingPick();
           if (!pick) return;
           const rect = pick.range.getBoundingClientRect();
@@ -102,17 +110,23 @@ export default class HighlightCompanion extends Plugin {
             listener.registerDomEvent(button, 'pointerdown', event => event.preventDefault());
             listener.registerDomEvent(button, 'click', () => act(pick, undo));
           };
-          add('高亮并收录', false); add('撤销高亮', true);
+          add('高亮并收录', false); add('撤销高亮并移除重点', true);
           const viewport = element.ownerDocument.defaultView?.innerWidth ?? 320;
-          const halfWidth = Math.min(130, (viewport - 16) / 2);
+          const halfWidth = bar.getBoundingClientRect().width / 2;
           bar.style.left = `${Math.max(halfWidth + 8, Math.min(rect.left + rect.width / 2, viewport - halfWidth - 8))}px`;
-          bar.style.top = `${rect.top > 64 ? rect.top - 10 : rect.bottom + 10}px`;
-          bar.classList.toggle('hc-reading-actions-below', rect.top <= 64);
+          bar.style.top = `${rect.top > 110 ? rect.top - 10 : rect.bottom + 10}px`;
+          bar.classList.toggle('hc-reading-actions-below', rect.top <= 110);
         }, 120);
       };
       listener.registerDomEvent(element.ownerDocument, 'selectionchange', scheduleMobileActions);
-      listener.registerDomEvent(element, 'touchend', scheduleMobileActions, { passive: true });
-      listener.registerDomEvent(element, 'pointerup', scheduleMobileActions, { passive: true });
+      const start = (event: Event) => { if (mobileActions?.contains(event.target as Node)) return; dragging = true; clearMobileActions(); };
+      const end = () => { dragging = false; scheduleMobileActions(); };
+      listener.registerDomEvent(element.ownerDocument, 'touchstart', start, { passive: true });
+      listener.registerDomEvent(element.ownerDocument, 'pointerdown', start, { passive: true });
+      listener.registerDomEvent(element.ownerDocument, 'touchend', end, { passive: true });
+      listener.registerDomEvent(element.ownerDocument, 'pointerup', end, { passive: true });
+      listener.registerDomEvent(element.ownerDocument, 'touchcancel', end, { passive: true });
+      listener.registerDomEvent(element.ownerDocument, 'pointercancel', end, { passive: true });
       // iOS scrolls the reading pane while a selection handle is being moved.
       // Reposition after that scroll instead of immediately hiding the actions.
       listener.registerDomEvent(element.ownerDocument, 'scroll', scheduleMobileActions, true);
@@ -127,18 +141,87 @@ export default class HighlightCompanion extends Plugin {
       if (info?.lineStart !== 0 && !element.querySelector('h1')) return;
       const toolbar = element.createDiv({ cls: 'hc-toolbar' });
       const child = new MarkdownRenderChild(toolbar); context.addChild(child);
-      const add = (name: string, fn: () => void) => { const button = toolbar.createEl('button', { text: name }); child.registerDomEvent(button, 'click', fn); };
-      add('整理重点', () => new OrganizeModal(this.app, this, b).open());
-      add('撤销高亮与重点', () => new OrganizeModal(this.app, this, b).open());
-      add('生成 / 增补导图', () => this.chooseCanvas(b));
-      add('另存完整导图', () => this.run(() => this.exportCanvas(b, true)));
+      toolbar.setAttribute('role', 'group'); toolbar.setAttribute('aria-label', '重点笔记操作');
+      const add = (name: string, fn: () => void, primary = false) => {
+        const button = toolbar.createEl('button', { text: name, cls: primary ? 'mod-cta' : '' });
+        child.registerDomEvent(button, 'click', fn); return button;
+      };
+      add('整理重点', () => new OrganizeModal(this.app, this, b).open(), true);
+      add('新增重点', () => new ManualGroupModal(this.app, this, b).open());
+      add('思维导图', () => this.chooseCanvas(b));
+      const more = add('更多', () => this.showNoteMenu(b, more));
+      more.setAttribute('aria-haspopup', 'menu');
     });
-    this.app.workspace.onLayoutReady(() => this.run(async () => { await finishPending(this.state, this.io); await this.reconcile(); }));
+    this.registerMobileEditorActions();
+    this.app.workspace.onLayoutReady(() => this.run(async () => {
+      await finishPending(this.state, this.io); await this.reconcile();
+      for (const binding of this.state.bindings) await this.change(binding.target, migrateGroupDisplays);
+    }));
+  }
+  showNoteMenu(binding: Binding, anchor: HTMLElement) {
+    const menu = new Menu();
+    menu.addItem(i => i.setTitle('返回原文').setIcon('book-open').onClick(() => this.run(() => this.open(binding.source))));
+    menu.addSeparator();
+    menu.addItem(i => i.setTitle('移除收录…').setIcon('trash-2').onClick(() => new OrganizeModal(this.app, this, binding, 'remove').open()));
+    menu.addItem(i => i.setTitle('恢复上次撤销').setIcon('redo-2').setDisabled(!this.state.lastUndo).onClick(() => this.run(() => this.restoreUndo())));
+    menu.addSeparator();
+    menu.addItem(i => i.setTitle('检查绑定并恢复未完成操作').setIcon('refresh-cw').onClick(() => this.run(async () => { await finishPending(this.state, this.io); await this.reconcile(true); new Notice('恢复与检查完成。'); })));
+    const rect = anchor.getBoundingClientRect(); menu.showAtPosition({ x: rect.left, y: rect.bottom + 6 });
+  }
+  registerMobileEditorActions() {
+    let bar: HTMLElement | undefined, timer: number | undefined, dragging = false;
+    const mobile = () => Platform.isMobileApp || document.body.classList.contains('is-mobile');
+    const clear = () => { bar?.remove(); bar = undefined; if (timer !== undefined) window.clearTimeout(timer); };
+    const schedule = () => {
+      clear();
+      if (!mobile() || dragging) return;
+      timer = window.setTimeout(() => {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (dragging || !view?.file || view.getMode() !== 'source') return;
+        const snapshot = snapshotSelection(view.editor);
+        if (!snapshot || snapshot.from === snapshot.to) return;
+        const range = document.getSelection();
+        if (!range?.rangeCount || !view.containerEl.contains(range.anchorNode)) return;
+        const rect = range.getRangeAt(0).getBoundingClientRect();
+        if (!rect.width && !rect.height) return;
+        const file = view.file;
+        bar = document.body.createDiv({ cls: 'hc-reading-actions' });
+        bar.setAttribute('role', 'toolbar'); bar.setAttribute('aria-label', '选中文字操作');
+        for (const [label, undo] of [['高亮并收录', false], ['撤销高亮并移除重点', true]] as const) {
+          const button = bar.createEl('button', { text: label });
+          button.onpointerdown = event => event.preventDefault();
+          button.onclick = () => { clear(); this.run(() => undo ? this.undoSnapshot(file, snapshot) : this.collectSnapshot(file, snapshot)); };
+        }
+        const half = bar.getBoundingClientRect().width / 2;
+        bar.style.left = `${Math.max(half + 8, Math.min(rect.left + rect.width / 2, window.innerWidth - half - 8))}px`;
+        bar.style.top = `${rect.top > 110 ? rect.top - 10 : rect.bottom + 10}px`;
+        bar.classList.toggle('hc-reading-actions-below', rect.top <= 110);
+      }, 180);
+    };
+    this.registerDomEvent(document, 'contextmenu', event => {
+      if (!mobile()) return;
+      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+      if (!view || view.getMode() !== 'source' || !view.containerEl.contains(event.target as Node)) return;
+      event.preventDefault(); event.stopImmediatePropagation(); schedule();
+    }, true);
+    const start = (event: Event) => { if (bar?.contains(event.target as Node)) return; dragging = true; clear(); };
+    const end = () => { dragging = false; schedule(); };
+    this.registerDomEvent(document, 'pointerdown', start, { passive: true });
+    this.registerDomEvent(document, 'touchstart', start, { passive: true });
+    this.registerDomEvent(document, 'pointerup', end, { passive: true });
+    this.registerDomEvent(document, 'touchend', end, { passive: true });
+    this.registerDomEvent(document, 'pointercancel', end, { passive: true });
+    this.registerDomEvent(document, 'touchcancel', end, { passive: true });
+    this.registerDomEvent(document, 'selectionchange', schedule);
+    this.registerDomEvent(document, 'scroll', schedule, true);
+    this.registerDomEvent(window, 'resize', schedule);
+    this.registerDomEvent(document, 'keydown', event => { if (event.key === 'Escape') clear(); });
+    this.register(clear);
   }
   showUndoPicker(file = this.app.workspace.getActiveFile()) {
     const binding = this.state.bindings.find(b => b.source === file?.path || b.target === file?.path);
     if (!binding) throw new Error('请打开已绑定的课本或重点笔记，再撤销收录。');
-    new OrganizeModal(this.app, this, binding).open();
+    new OrganizeModal(this.app, this, binding, 'remove').open();
   }
   showPanel() {
     const file = this.app.workspace.getActiveFile();
@@ -301,7 +384,7 @@ export default class HighlightCompanion extends Plugin {
       .filter((path): path is string => !!path && this.app.vault.getAbstractFileByPath(path) instanceof TFile);
   }
   chooseCanvas(binding: Binding) { new CanvasExportModal(this.app, this, binding).open(); }
-  async exportCanvas(binding: Binding, fresh: boolean, selectedPath?: string) {
+  async exportCanvas(binding: Binding, fresh: boolean, selectedPath?: string, selection?: string[]) {
     const note = await this.read(binding.target);
     this.validateIndex(note, binding);
     let path = selectedPath ?? binding.canvas;
@@ -310,7 +393,7 @@ export default class HighlightCompanion extends Plugin {
       const parent = binding.target.includes('/') ? binding.target.slice(0, binding.target.lastIndexOf('/') + 1) : '';
       const base = parent + '思维导图/' + this.file(binding.target).basename + '-思维导图'; path = base + '.canvas';
       let suffix = 2; while (this.app.vault.getAbstractFileByPath(path)) path = `${base}-${suffix++}.canvas`;
-      const generated = buildCanvas(note, binding);
+      const generated = buildCanvas(note, binding, undefined, undefined, selection);
       await this.ensureFolder(path);
       await this.app.vault.create(path, generated);
       this.state.canvasLedgers ??= {}; this.state.canvasLedgers[path] = { ...JSON.parse(generated).highlightCompanion, target: binding.target };
@@ -337,7 +420,7 @@ export default class HighlightCompanion extends Plugin {
       binding.canvas = path; await this.io.save();
       await this.change(binding.target, text => rewriteBinding(text, binding));
     }
-    await this.open(path); new Notice(fresh ? '已另存完整导图。' : '导图已生成或增补，已有卡片编辑保持不变。');
+    await this.open(path); new Notice(selection ? '已按勾选内容创建导图。' : fresh ? '已另存完整导图。' : '导图已生成或增补，已有卡片编辑保持不变。');
   }
   async reconcile(fullScan = false) {
     const found: Binding[] = [];
@@ -421,7 +504,7 @@ export class CapturePanel extends Modal {
     this.contentEl.createEl('p', { cls: 'hc-subtitle', text: this.file.basename });
     const isSource = this.file.extension === 'md' && !this.plugin.state.bindings.some(b => b.target === this.file.path);
     const preview = isSource ? selectionPreview(this.capturedSelection) : '';
-    this.contentEl.createEl('p', { cls: 'hc-capture-preview', text: preview || '在课本编辑视图长按并选择文字，再使用“高亮并收录”。' });
+    if (isSource) this.contentEl.createEl('p', { cls: 'hc-capture-preview', text: preview || '先在原文中选中文字，即可高亮并收录。' });
     const actions = this.contentEl.createDiv({ cls: 'hc-panel-actions' });
     const add = (label: string, action: () => Promise<unknown>, enabled = true, primary = false) => {
       const button = actions.createEl('button', { text: label, cls: primary ? 'mod-cta' : '' });
@@ -431,14 +514,23 @@ export class CapturePanel extends Modal {
         this.submitted = true; this.close(); this.plugin.run(action);
       };
     };
-    add('高亮并收录所选文字', () => this.plugin.collectSnapshot(this.file, this.capturedSelection!), !!preview, true);
-    add('收录已有高亮', () => this.plugin.importActive(this.file), isSource);
-    add('撤销高亮与重点', async () => this.plugin.showUndoPicker(this.file), this.plugin.state.bindings.some(b => b.source === this.file.path || b.target === this.file.path));
-    add('恢复上次撤销', () => this.plugin.restoreUndo(), !!this.plugin.state.lastUndo);
-    add('打开重点笔记', async () => this.plugin.open((await this.plugin.contextBinding(this.file)).target));
-    add('整理关键词', async () => new OrganizeModal(this.app, this.plugin, await this.plugin.contextBinding(this.file)).open());
-    add('生成 / 增补导图', async () => this.plugin.chooseCanvas(await this.plugin.contextBinding(this.file)));
-    this.contentEl.createEl('p', { cls: 'hc-subtitle', text: '手机上可在“设置 → 移动端 → 管理工具栏”添加“高亮并收录”，选中文字后直接点击工具栏图标。' });
+    if (isSource) {
+      add('高亮并收录所选文字', () => this.plugin.collectSnapshot(this.file, this.capturedSelection!), !!preview, true);
+      add('批量收录已有高亮', () => this.plugin.importActive(this.file));
+      add('打开重点笔记', async () => this.plugin.open((await this.plugin.contextBinding(this.file)).target));
+    } else {
+      if (this.file.extension === 'canvas') add('返回重点笔记', async () => this.plugin.open((await this.plugin.contextBinding(this.file)).target));
+      add('整理重点', async () => new OrganizeModal(this.app, this.plugin, await this.plugin.contextBinding(this.file)).open(), true, true);
+      add('新增重点', async () => new ManualGroupModal(this.app, this.plugin, await this.plugin.contextBinding(this.file)).open());
+      add('思维导图', async () => this.plugin.chooseCanvas(await this.plugin.contextBinding(this.file)));
+    }
+    const recovery = this.contentEl.createEl('details', { cls: 'hc-manage' });
+    recovery.createEl('summary', { text: '移除与恢复' });
+    const remove = recovery.createEl('button', { text: '移除收录…' });
+    remove.disabled = !this.plugin.state.bindings.some(b => b.source === this.file.path || b.target === this.file.path);
+    remove.onclick = () => { this.close(); this.plugin.run(async () => this.plugin.showUndoPicker(this.file)); };
+    const restore = recovery.createEl('button', { text: '恢复上次撤销' }); restore.disabled = !this.plugin.state.lastUndo;
+    restore.onclick = () => { this.close(); this.plugin.run(() => this.plugin.restoreUndo()); };
     const close = this.contentEl.createEl('button', { text: '关闭', cls: 'hc-close' }); close.onclick = () => this.close();
   }
   onClose() { this.contentEl.empty(); }
@@ -472,34 +564,168 @@ export class BindModal extends Modal {
   onClose() { if (!this.submitted) this.resolve?.(null); this.contentEl.empty(); }
 }
 
-class CanvasExportModal extends Modal {
+class ManualGroupModal extends Modal {
+  saving = false;
   constructor(app: App, private plugin: HighlightCompanion, private binding: Binding) { super(app); }
-  onOpen() {
-    this.modalEl.addClass('hc-responsive-modal');
-    this.setTitle('生成思维导图');
-    const paths = this.plugin.canvasChoices(this.binding);
-    let selected = paths.includes(this.binding.canvas ?? '') ? this.binding.canvas! : paths[0];
-    this.contentEl.createEl('p', { text: '新建导图会在重点笔记旁自动创建“思维导图”文件夹，并保存一份当前完整内容。' });
-    if (paths.length) {
-      new Setting(this.contentEl).setName('已有思维导图').setDesc('补充只加入未导出的内容，保留手动编辑。请先关闭要补充的导图标签页。').addDropdown(d => {
-        paths.forEach(path => d.addOption(path, path));
-        d.setValue(selected).onChange(value => selected = value);
+  onOpen() { this.modalEl.addClass('hc-responsive-modal'); this.setTitle('新增重点'); this.plugin.run(() => this.render()); }
+  async render() {
+    const parsed = parseDocument(await this.plugin.read(this.binding.target));
+    let chapter = parsed.chapters[0]?.id ?? '', title = '', content = '';
+    const types = new Set<ExamType>();
+    new Setting(this.contentEl).setName('所属章节').addDropdown(d => {
+      d.addOption('', '新建“手写重点”章节');
+      parsed.chapters.forEach(c => d.addOption(c.id, c.meta.title));
+      d.setValue(chapter).onChange(v => chapter = v);
+    });
+    new Setting(this.contentEl).setName('重点名称').addText(t => t.onChange(v => title = v));
+    new Setting(this.contentEl).setName('重点内容').setDesc('保存到重点笔记后，可继续直接书写和修改。支持 Markdown。').addTextArea(t => {
+      t.inputEl.rows = 6; t.setPlaceholder('书写重点内容…').onChange(v => content = v);
+    });
+    for (const type of examTypes) new Setting(this.contentEl).setName(type).addToggle(t => t.onChange(on => { if (on) types.add(type); else types.delete(type); }));
+    new Setting(this.contentEl).addButton(b => b.setButtonText('添加并打开重点笔记').setCta().onClick(() => {
+      const values = { chapter, title, content, types: [...types] };
+      if (this.saving) return;
+      this.saving = true;
+      this.plugin.run(async () => {
+        try {
+          let groupId = '';
+          await this.plugin.change(this.binding.target, text => {
+            const before = new Set(parseDocument(text).groups.map(g => g.id));
+            const result = addManualGroup(text, values.chapter, values.title, values.content, values.types);
+            groupId = parseDocument(result).groups.find(g => !before.has(g.id))!.id;
+            return result;
+          });
+          this.close(); await this.plugin.open(this.binding.target);
+          const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+          if (view?.file?.path === this.binding.target) {
+            await view.leaf.setViewState({ type: 'markdown', state: { file: this.binding.target, mode: 'source' } });
+            const editor = view.editor, text = editor.getValue();
+            const group = parseDocument(text).groups.find(g => g.id === groupId);
+            if (group) {
+              const contentStart = text.indexOf(values.content.trim() || '在这里书写重点内容。', group.bodyFrom);
+              if (contentStart >= 0) {
+                const pos = editor.offsetToPos(contentStart);
+                editor.setCursor(pos); editor.scrollIntoView({ from: pos, to: pos }, true); editor.focus();
+              }
+            }
+          }
+          new Notice('已添加重点，可在笔记中继续书写。');
+        } finally { this.saving = false; }
       });
-      new Setting(this.contentEl).addButton(button => button.setButtonText('补充至所选导图').setCta().onClick(() => {
-        this.close(); this.plugin.run(() => this.plugin.exportCanvas(this.binding, false, selected));
-      }));
-    } else this.contentEl.createEl('p', { text: '未找到这篇重点笔记可补充的导图。可以新建一份，原来的导图记录会保留。' });
-    new Setting(this.contentEl).addButton(button => button.setButtonText('新建完整思维导图').onClick(() => {
-      this.close(); this.plugin.run(() => this.plugin.exportCanvas(this.binding, true));
     }));
   }
   onClose() { this.contentEl.empty(); }
 }
 
-export class OrganizeModal extends Modal {
-  selected = new Set<string>(); title = ''; group = ''; chapter = ''; alive = true; busy = false; step: 'select' | 'name' = 'select';
+class CanvasSelectionModal extends Modal {
   constructor(app: App, private plugin: HighlightCompanion, private binding: Binding) { super(app); }
-  onOpen() { this.modalEl.addClass('hc-organizer', 'hc-responsive-modal'); this.setTitle('整理重点'); void this.render().catch(e => new Notice(e.message)); }
+  onOpen() { this.modalEl.addClass('hc-responsive-modal'); this.setTitle('选择导图内容'); this.plugin.run(() => this.render()); }
+  async render() {
+    const text = await this.plugin.read(this.binding.target), parsed = parseDocument(text);
+    const selected = new Set<string>();
+    this.contentEl.createEl('p', { text: '可跨章节勾选。选择重点会包含其全部关键词；单独选择关键词只包含该词及所属重点、章节。' });
+    const boxes: HTMLInputElement[] = [];
+    let submit: HTMLButtonElement;
+    const tools = this.contentEl.createDiv({ cls: 'hc-selection-tools' });
+    tools.createEl('button', { text: '全选' }).onclick = () => { boxes.forEach(b => { b.checked = true; selected.add(b.value); }); submit.disabled = !selected.size; };
+    tools.createEl('button', { text: '清空' }).onclick = () => { boxes.forEach(b => b.checked = false); selected.clear(); submit.disabled = true; };
+    const row = (key: string, label: string, nested = false) => {
+      const el = this.contentEl.createEl('label', { cls: 'hc-row' });
+      if (nested) el.addClass('hc-nested-keyword');
+      const box = el.createEl('input', { type: 'checkbox' }); box.value = key; boxes.push(box);
+      el.createEl('span', { text: label });
+      box.onchange = () => { if (box.checked) selected.add(key); else selected.delete(key); submit.disabled = !selected.size; };
+    };
+    for (const c of parsed.chapters) {
+      this.contentEl.createEl('h3', { text: [...c.meta.parents.map(id => parsed.chapters.find(p => p.id === id)?.meta.title ?? ''), c.meta.title].join(' / ') });
+      for (const item of c.children) {
+        if (item.kind === 'group') {
+          row('g-' + item.id, '重点：' + groupTitle(text, item));
+          item.children.forEach(e => row('e-' + e.id, entryText(text, e), true));
+        } else row('e-' + item.id, entryText(text, item));
+      }
+    }
+    const footer = this.contentEl.createDiv({ cls: 'hc-merge-footer' });
+    const actions = footer.createDiv({ cls: 'hc-batch-actions' });
+    actions.createEl('button', { text: '返回' }).onclick = () => { this.close(); this.plugin.chooseCanvas(this.binding); };
+    submit = actions.createEl('button', { text: '创建导图', cls: 'mod-cta' }); submit.disabled = true;
+    let submitting = false;
+    submit.onclick = () => {
+      if (submitting) return;
+      submitting = true; submit.disabled = true;
+      const ids = [...selected]; this.plugin.run(async () => {
+        try { await this.plugin.exportCanvas(this.binding, true, undefined, ids); this.close(); }
+        finally { submitting = false; submit.disabled = !selected.size; }
+      });
+    };
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
+class CanvasExportModal extends Modal {
+  constructor(app: App, private plugin: HighlightCompanion, private binding: Binding) { super(app); }
+  onOpen() {
+    this.modalEl.addClass('hc-responsive-modal');
+    this.setTitle('思维导图');
+    const paths = this.plugin.canvasChoices(this.binding);
+    let selected = paths.includes(this.binding.canvas ?? '') ? this.binding.canvas! : paths[0];
+    this.contentEl.createEl('h3', { text: '新建导图' });
+    this.contentEl.createEl('p', { cls: 'hc-subtitle', text: '选择内容范围，生成一份新的可编辑导图。' });
+    const choices = this.contentEl.createDiv({ cls: 'hc-export-choices' });
+    const choice = (title: string, description: string, action: () => void) => {
+      const button = choices.createEl('button', { cls: 'hc-choice' });
+      button.createEl('strong', { text: title }); button.createEl('span', { text: description }); button.onclick = action;
+    };
+    choice('全部内容', '包含全部章节、重点和关键词', () => {
+      this.close(); this.plugin.run(() => this.plugin.exportCanvas(this.binding, true));
+    });
+    choice('选择内容…', '勾选需要复习的重点和关键词', () => {
+      this.close(); new CanvasSelectionModal(this.app, this.plugin, this.binding).open();
+    });
+    if (paths.length) {
+      const update = this.contentEl.createDiv({ cls: 'hc-export-update' });
+      update.createEl('h3', { text: '增补已有导图' });
+      new Setting(update).setName('选择导图').setDesc('沿用原来的内容范围，补充新增内容并更新分组连线，保留卡片编辑。请先关闭所选导图。').addDropdown(d => {
+        paths.forEach(path => d.addOption(path, path));
+        d.setValue(selected).onChange(value => selected = value);
+      });
+      new Setting(update).addButton(button => button.setButtonText('增补这份导图').onClick(() => {
+        this.close(); this.plugin.run(() => this.plugin.exportCanvas(this.binding, false, selected));
+      }));
+    }
+    this.contentEl.createEl('p', { cls: 'hc-subtitle', text: '新导图保存在重点笔记旁的“思维导图”文件夹，同名文件会自动编号。' });
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
+class ConfirmActionModal extends Modal {
+  constructor(app: App, private heading: string, private description: string, private label: string, private action: () => void) { super(app); }
+  onOpen() {
+    this.modalEl.addClass('hc-responsive-modal'); this.setTitle(this.heading);
+    this.contentEl.createEl('p', { text: this.description });
+    new Setting(this.contentEl).addButton(b => b.setButtonText('取消').onClick(() => this.close()))
+      .addButton(b => { b.setButtonText(this.label).setWarning().onClick(() => { this.close(); this.action(); }); });
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
+class GroupDestinationModal extends Modal {
+  constructor(app: App, private groups: { id: string; title: string }[], private choose: (id: string) => void) { super(app); }
+  onOpen() {
+    this.modalEl.addClass('hc-responsive-modal'); this.setTitle('加入哪个重点？');
+    let selected = this.groups[0].id;
+    new Setting(this.contentEl).setName('目标重点').addDropdown(d => { this.groups.forEach(g => d.addOption(g.id, g.title)); d.setValue(selected).onChange(id => selected = id); });
+    new Setting(this.contentEl).addButton(b => b.setButtonText('取消').onClick(() => this.close()))
+      .addButton(b => b.setButtonText('加入重点').setCta().onClick(() => { this.close(); this.choose(selected); }));
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
+export class OrganizeModal extends Modal {
+  keywordDraft = ''; addingKeyword = false;
+  selected = new Set<string>(); title = ''; group = ''; chapter = ''; alive = true; busy = false; step: 'select' | 'name' = 'select';
+  constructor(app: App, private plugin: HighlightCompanion, private binding: Binding, private mode: 'keywords' | 'groups' | 'remove' = 'keywords') { super(app); }
+  onOpen() { this.modalEl.addClass('hc-organizer', 'hc-responsive-modal'); this.setTitle(this.mode === 'remove' ? '移除收录' : '整理重点'); void this.render().catch(e => new Notice(e.message)); }
   async updateNote(update: (text: string) => string, success = '重点已更新。') {
     if (this.busy) return;
     this.busy = true;
@@ -513,34 +739,49 @@ export class OrganizeModal extends Modal {
     const text = await this.plugin.read(this.binding.target), parsed = parseDocument(text);
     if (!this.alive) return;
     this.contentEl.empty();
-    const chapters = parsed.chapters.filter(c => parsed.entries.some(e => e.meta.chapter === c.id));
-    if (!this.chapter || !chapters.some(c => c.id === this.chapter)) this.chapter = chapters[0]?.id ?? '';
+    const chapters = this.mode === 'keywords' ? parsed.chapters : parsed.chapters.filter(c => c.children.length > 0);
+    if (!(this.mode === 'remove' && this.chapter === '*') && (!this.chapter || !chapters.some(c => c.id === this.chapter))) this.chapter = this.mode === 'remove' ? '*' : (chapters.find(c => c.children.length > 0) ?? chapters[0])?.id ?? '';
     const picked = parsed.entries.filter(e => this.selected.has(e.id));
     if (this.step === 'name') {
       this.renderName(text, parsed, picked);
       return;
     }
-    this.contentEl.createEl('p', { cls: 'hc-subtitle', text: '第 1 步：选择一个章节，再勾选一个或多个关键词来命名重点。' });
+    if (this.mode !== 'remove') {
+      const tabs = this.contentEl.createDiv({ cls: 'hc-view-switch' }); tabs.setAttribute('role', 'group'); tabs.setAttribute('aria-label', '整理方式');
+      for (const [mode, label] of [['keywords', '关键词归组'], ['groups', '重点管理']] as const) {
+        const button = tabs.createEl('button', { text: label }); button.setAttribute('aria-pressed', String(this.mode === mode));
+        button.onclick = () => { this.mode = mode; this.selected.clear(); this.plugin.run(async () => {
+          await this.render(); this.contentEl.querySelector<HTMLButtonElement>('.hc-view-switch button[aria-pressed=true]')?.focus();
+        }); };
+      }
+    }
+    this.contentEl.createEl('p', { cls: 'hc-subtitle', text: this.mode === 'remove'
+      ? '勾选要移除的条目。确认后会移除条目及其手写说明，并取消关联的原文高亮；自定义关键词不影响原文。'
+      : this.mode === 'groups' ? '在对应重点下修改名称和题型，或解散重点。' : '先选择关键词，再创建重点或加入已有重点。' });
     new Setting(this.contentEl).setName('章节筛选').addDropdown(d => {
+      if (this.mode === 'remove') d.addOption('*', '全部章节');
       for (const c of chapters) {
         const label = [...c.meta.parents.map(id => parsed.chapters.find(x => x.id === id)?.meta.title ?? ''), c.meta.title].join(' / ');
         d.addOption(c.id, label);
       }
       d.setValue(this.chapter).onChange(v => { this.chapter = v; this.selected.clear(); void this.render().catch(e => new Notice(e.message)); });
     });
-    const chapterEntries = parsed.entries.filter(e => e.meta.chapter === this.chapter);
+    if (this.mode === 'groups') { this.renderGroups(text, parsed); return; }
+    const chapterEntries = parsed.entries.filter(e => this.chapter === '*' || e.meta.chapter === this.chapter);
     let count: HTMLElement, next: HTMLButtonElement, hint: HTMLElement;
     const refreshSelection = () => {
       count?.setText(`已勾选 ${this.selected.size} 个关键词`);
-      if (next) next.disabled = this.selected.size === 0;
-      hint?.setText(this.selected.size === 0 ? '请勾选至少 1 个关键词。' : this.selected.size === 1 ? '为这个关键词创建一个命名重点。' : '将这些关键词合并为一个可命名的重点。');
+      if (next) { next.disabled = this.selected.size === 0; next.setText(this.mode === 'remove' ? `移除所选 ${this.selected.size} 条…` : '创建重点…'); }
+      hint?.setText(this.mode === 'remove' ? '移除后，可在继续编辑前通过“更多 → 恢复上次撤销”恢复。' : this.selected.size === 0 ? '勾选关键词后显示可用操作。' : '可以创建新重点，也可以放入已有重点。');
+      batchControls?.forEach(button => button.disabled = this.selected.size === 0);
     };
+    const batchControls: HTMLButtonElement[] = [];
     const selectionTools = this.contentEl.createDiv({ cls: 'hc-selection-tools' });
-    const all = selectionTools.createEl('button', { text: '本章全选' });
+    const all = selectionTools.createEl('button', { text: this.chapter === '*' ? '全选' : '本章全选' });
     const clear = selectionTools.createEl('button', { text: '清空选择' });
     all.onclick = () => { chapterEntries.forEach(e => this.selected.add(e.id)); void this.render(); };
     clear.onclick = () => { this.selected.clear(); void this.render(); };
-    if (!parsed.entries.length) this.contentEl.createEl('p', { text: '还没有收录内容。请回到课本选择文字，使用“高亮并收录”。' });
+    if (!chapterEntries.length) this.contentEl.createEl('p', { text: '此处没有收录的关键词。可切换章节，或到“重点管理”查看手写重点。', cls: 'hc-empty' });
     const section = this.contentEl.createDiv({ cls: 'hc-chapter hc-keyword-list' });
     const current = chapters.find(c => c.id === this.chapter);
     if (current) section.createEl('h3', { text: [...current.meta.parents.map(id => parsed.chapters.find(x => x.id === id)?.meta.title ?? ''), current.meta.title].join(' / ') });
@@ -549,17 +790,71 @@ export class OrganizeModal extends Modal {
       const checkbox = row.createEl('input', { type: 'checkbox' }); checkbox.checked = this.selected.has(e.id);
       checkbox.onchange = () => { if (checkbox.checked) this.selected.add(e.id); else this.selected.delete(e.id); refreshSelection(); };
       const copy = row.createDiv(); copy.createEl('span', { text: entryText(text, e) });
+      if (this.chapter === '*') copy.createEl('small', { text: parsed.chapters.find(c => c.id === e.meta.chapter)?.meta.title ?? '', cls: 'hc-group-label' });
       if (e.parent?.kind === 'group') copy.createEl('small', { text: '当前重点：' + groupTitle(text, e.parent), cls: 'hc-group-label' });
+    }
+    if (this.mode === 'keywords') {
+      const custom = this.contentEl.createDiv({ cls: 'hc-custom-keyword' });
+      const label = custom.createEl('label', { text: '自定义关键词' });
+      const input = label.createEl('input', { type: 'text', placeholder: '输入关键词，按回车添加' });
+      input.value = this.keywordDraft;
+      const add = custom.createEl('button', { text: '添加关键词' });
+      const refresh = () => { add.disabled = this.addingKeyword || !input.value.trim(); };
+      input.oninput = () => { this.keywordDraft = input.value; refresh(); };
+      add.onclick = () => {
+        if (this.addingKeyword || this.busy || !input.value.trim()) return;
+        const value = input.value, chapter = this.chapter;
+        this.addingKeyword = true; input.disabled = true; refresh();
+        this.plugin.run(async () => {
+          try {
+            await finishPending(this.plugin.state, this.plugin.io);
+            let created: ReturnType<typeof addCustomEntry> | undefined;
+            await this.plugin.change(this.binding.target, current => {
+              created = addCustomEntry(current, chapter, value); return created.note;
+            });
+            this.chapter = created!.entry.chapter;
+            this.selected.add(created!.entry.id); this.keywordDraft = '';
+            this.addingKeyword = false;
+            await this.render();
+            this.contentEl.querySelector<HTMLInputElement>('.hc-custom-keyword input')?.focus();
+            new Notice('关键词已添加并勾选。');
+          } finally { this.addingKeyword = false; input.disabled = false; refresh(); }
+        });
+      };
+      input.onkeydown = event => {
+        if (event.key === 'Enter' && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); add.click(); }
+      };
+      custom.createEl('small', { text: '添加到当前章节，可和其他关键词一起归入重点、生成导图。', cls: 'hc-subtitle' });
+      refresh();
     }
     const footer = this.contentEl.createDiv({ cls: 'hc-merge-footer' });
     count = footer.createEl('p', { cls: 'hc-selection', text: `已勾选 ${this.selected.size} 个关键词` });
     count.setAttribute('role', 'status'); count.setAttribute('aria-live', 'polite');
-    next = footer.createEl('button', { text: '下一步：命名重点', cls: 'mod-cta' });
+    const batch = footer.createDiv({ cls: 'hc-batch-actions' });
+    next = batch.createEl('button', { text: '创建重点…', cls: this.mode === 'remove' ? 'mod-warning' : 'mod-cta' });
     next.disabled = this.selected.size === 0;
-    next.onclick = () => { this.step = 'name'; void this.render(); };
+    next.onclick = () => {
+      if (this.mode === 'remove') {
+        const ids = [...this.selected];
+        new ConfirmActionModal(this.app, '移除这些收录？', `将移除 ${ids.length} 条收录及条目内的手写说明，并取消关联的原文高亮。自定义关键词不影响原文；原文文字保留，已有导图不变。`, '确认移除', () => this.plugin.run(async () => {
+          await this.plugin.undoEntries(this.binding, ids); this.selected.clear(); await this.render();
+        })).open();
+      } else { this.step = 'name'; void this.render(); }
+    };
+    if (this.mode !== 'remove') {
+      const join = batch.createEl('button', { text: '加入已有重点…' }); batchControls.push(join);
+      join.onclick = () => {
+        const groups = parsed.groups.filter(g => g.meta.chapter === this.chapter);
+        if (!groups.length) { new Notice('本章还没有重点，请先创建重点。'); return; }
+        new GroupDestinationModal(this.app, groups.map(g => ({ id: g.id, title: groupTitle(text, g) })), id => {
+          const ids = [...this.selected]; this.plugin.run(() => this.updateNote(current => arrange(current, ids, { type: 'add', group: id })));
+        }).open();
+      };
+      const detach = batch.createEl('button', { text: '移出重点' }); batchControls.push(detach);
+      detach.onclick = () => { const ids = [...this.selected]; this.plugin.run(() => this.updateNote(current => arrange(current, ids, { type: 'remove' }))); };
+    }
     hint = footer.createEl('small');
     refreshSelection();
-    this.renderManage(text, parsed);
     const done = this.contentEl.createEl('button', { text: '完成', cls: 'hc-close' }); done.onclick = () => this.close();
   }
   renderName(text: string, parsed: ReturnType<typeof parseDocument>, picked: ReturnType<typeof parseDocument>['entries']) {
@@ -586,27 +881,31 @@ export class OrganizeModal extends Modal {
       }, ids.length === 1 ? `已创建重点「${title.trim()}」。` : `已将 ${ids.length} 个关键词合并为重点「${title.trim()}」。`));
     };
   }
-  renderManage(text: string, parsed: ReturnType<typeof parseDocument>) {
-    const details = this.contentEl.createEl('details', { cls: 'hc-manage' });
-    details.createEl('summary', { text: '管理已有重点或撤销条目' });
-    new Setting(details).setName('已有重点').addDropdown(d => {
-      d.addOption('', '请选择…');
-      for (const g of parsed.groups.filter(g => g.meta.chapter === this.chapter)) d.addOption(g.id, groupTitle(text, g));
-      d.setValue(this.group).onChange(v => this.group = v);
-    });
-    new Setting(details).setName('新名称').addText(t => t.setPlaceholder('重命名时填写').setValue(this.title).onChange(v => this.title = v));
-    const controls = details.createDiv({ cls: 'hc-actions' });
-    const action = (label: string, update: (current: string, ids: string[]) => string) => {
-      const button = controls.createEl('button', { text: label });
-      button.onclick = () => { const ids = [...this.selected]; this.plugin.run(() => this.updateNote(current => update(current, ids))); };
-    };
-    action('加入已有重点', (current, ids) => arrange(current, ids, { type: 'add', group: this.group }));
-    action('移出重点', (current, ids) => arrange(current, ids, { type: 'remove' }));
-    action('重命名重点', current => renameGroup(current, this.group, this.title));
-    action('解散重点', current => dissolveGroup(current, this.group));
-    const undo = controls.createEl('button', { text: '撤销所选高亮与重点' });
-    undo.onclick = () => { const ids = [...this.selected]; this.plugin.run(async () => { await this.plugin.undoEntries(this.binding, ids); this.selected.clear(); await this.render(); }); };
-    details.createEl('p', { cls: 'hc-subtitle', text: '撤销会同时取消原文高亮并移除条目。可在继续编辑前执行“恢复上次撤销”。' });
+  renderGroups(text: string, parsed: ReturnType<typeof parseDocument>) {
+    const groups = parsed.groups.filter(g => g.meta.chapter === this.chapter);
+    if (!groups.length) this.contentEl.createEl('p', { text: '本章还没有命名重点。可以先在“关键词归组”中创建，或回到笔记新增手写重点。', cls: 'hc-empty' });
+    for (const group of groups) {
+      const card = this.contentEl.createEl('details', { cls: 'hc-group-card' });
+      card.createEl('summary', { text: groupTitle(text, group) });
+      card.createEl('p', { cls: 'hc-subtitle', text: group.children.length ? `包含 ${group.children.length} 个关键词` : '手写重点' });
+      let title = group.meta.title;
+      const types = new Set(group.meta.examTypes ?? []);
+      new Setting(card).setName('名称').addText(input => input.setValue(title).onChange(value => title = value));
+      const choices = card.createEl('fieldset', { cls: 'hc-type-options' }); choices.createEl('legend', { text: '题型 · 可多选' });
+      for (const type of examTypes) {
+        const label = choices.createEl('label');
+        const box = label.createEl('input', { type: 'checkbox' }); box.checked = types.has(type); label.createSpan({ text: type });
+        box.onchange = () => { if (box.checked) types.add(type); else types.delete(type); };
+      }
+      const actions = card.createDiv({ cls: 'hc-batch-actions' });
+      actions.createEl('button', { text: '保存修改', cls: 'mod-cta' }).onclick = () => {
+        const values = { title, types: [...types] };
+        this.plugin.run(() => this.updateNote(current => setExamTypes(renameGroup(current, group.id, values.title), group.id, values.types)));
+      };
+      actions.createEl('button', { text: '解散重点…', cls: 'hc-secondary-action' }).onclick = () => {
+        new ConfirmActionModal(this.app, '解散这个重点？', '保留关键词、原标题和手写说明，取消它们的重点归类。', '解散重点', () => this.plugin.run(() => this.updateNote(current => dissolveGroup(current, group.id)))).open();
+      };
+    }
   }
   onClose() { this.alive = false; this.contentEl.empty(); }
 }

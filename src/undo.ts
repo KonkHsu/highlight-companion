@@ -17,7 +17,7 @@ function sourceOccurrence(source: string, entry: Entry) {
 }
 
 export function removeHighlights(source: string, entries: Entry[]) {
-  const edits = entries.map(e => sourceOccurrence(source, e)).sort((a, b) => b.from - a.from);
+  const edits = entries.filter(e => e.origin !== 'custom').map(e => sourceOccurrence(source, e)).sort((a, b) => b.from - a.from);
   for (let i = 1; i < edits.length; i++) if (edits[i].to > edits[i - 1].from) throw new Error('高亮标识重叠，已停止撤销。');
   for (const edit of edits) source = source.slice(0, edit.from) + edit.replacement + source.slice(edit.to);
   // Keep block anchors and chapter IDs: other highlights and user-authored links may rely on them.
@@ -35,6 +35,7 @@ export function removeEntries(note: string, ids: string[]) {
 
 export function selectedEntryIds(source: string, entries: Entry[], from: number, to: number) {
   return entries.filter(entry => {
+    if (entry.origin === 'custom') return false;
     try { const range = sourceOccurrence(source, entry); return from === to ? from >= range.from && from < range.to : from < range.to && to > range.from; }
     catch { return false; }
   }).map(e => e.id);
