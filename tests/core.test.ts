@@ -8,6 +8,22 @@ import { commitCapture, finishPending, Storage } from '../src/engine';
 const binding: Binding = { id: 'book1', source: '课本/生物.md', target: '重点/生物.md' };
 function collect(source: string) { const captured = capture(source, binding.target); return { captured, note: appendEntries(newDocument(binding, '生物'), binding, captured.chapters, captured.entries) }; }
 
+test('new groups occupy the first selected position without sorting unrelated entries', () => {
+  const { note, captured } = collect('# 章\n\n==甲==、==乙==、==丙==、==丁==、==戊==');
+  const ids = captured.entries.map(e => e.id);
+  const grouped = arrange(note, [ids[3], ids[1]], { type: 'create', title: '乙丁' });
+  const parsed = parseDocument(grouped), group = parsed.groups[0];
+  assert.deepEqual(parsed.chapters[0].children.map(r => r.id), [ids[0], group.id, ids[2], ids[4]]);
+  assert.deepEqual(group.children.map(r => r.id), [ids[1], ids[3]]);
+  assert.equal(arrange(grouped, [ids[1]], { type: 'add', group: group.id }), grouped);
+  const joined = parseDocument(arrange(grouped, [ids[1], ids[4]], { type: 'add', group: group.id }));
+  assert.deepEqual(joined.groups[0].children.map(r => r.id), [ids[1], ids[3], ids[4]]);
+  assert.deepEqual(joined.chapters[0].children.map(r => r.id), [ids[0], group.id, ids[2]]);
+  const regrouped = parseDocument(arrange(grouped, [ids[1], ids[4]], { type: 'create', title: '新重点' }));
+  assert.equal(regrouped.groups.length, 2);
+  assert.deepEqual(regrouped.chapters[0].children.map(r => r.kind), ['entry', 'group', 'group', 'entry']);
+});
+
 test('custom keywords persist without source links, validate input and support empty notes', () => {
   const blank = newDocument(binding, '生物');
   assert.throws(() => addCustomEntry(blank, '', ' \n '), /请输入/);

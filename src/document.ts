@@ -126,19 +126,28 @@ export function migrateGroupDisplays(text: string): string {
 }
 export function arrange(text: string, ids: string[], action: { type: 'create'; title: string } | { type: 'add'; group: string } | { type: 'remove' }) {
   let parsed = parseDocument(text);
-  const selected = parsed.entries.filter(r => ids.includes(r.id));
+  let selected = parsed.entries.filter(r => ids.includes(r.id));
   if (!selected.length || selected.length !== new Set(ids).size) throw new Error('请选择有效的关键词条目。');
   if (new Set(selected.map(r => r.meta.chapter)).size !== 1) throw new Error('只能将同一章节的关键词归为一个重点。');
   const chapter = selected[0].meta.chapter;
   if (action.type === 'create' && !action.title.trim()) throw new Error('请输入重点名称。');
   if (action.type === 'add' && !parsed.groups.some(g => g.id === action.group && g.meta.chapter === chapter)) throw new Error('目标重点不属于所选章节。');
+  if (action.type === 'add') {
+    selected = selected.filter(r => r.parent?.id !== action.group);
+    if (!selected.length) return text;
+  }
   const chunks = selected.map(r => text.slice(r.from, r.to)).join('\n\n');
+  // A new group takes the first selected item's place, not the chapter's end.
+  // If that item is already grouped, insert beside its enclosing group (no nesting).
+  const first = selected[0];
+  const origin = first.parent?.kind === 'group' ? first.parent.to : first.from;
+  const insertion = origin - selected.filter(r => r.to <= origin).reduce((n, r) => n + r.to - r.from, 0);
   for (const r of [...selected].sort((a, b) => b.from - a.from)) text = text.slice(0, r.from) + text.slice(r.to);
   parsed = parseDocument(text);
   if (action.type === 'create') {
     const group: Group = { id: uid(), title: action.title.trim(), chapter };
     const chunk = `\n${open('group', group)}\n${groupHeading(group.title, group.examTypes ?? [])} ^hcg-${group.id}\n\n${chunks}\n${close('group', group.id)}\n`;
-    const offset = parsed.chapters.find(r => r.id === chapter)!.bodyTo;
+    const offset = insertion;
     text = text.slice(0, offset) + chunk + text.slice(offset);
   } else {
     const dest = action.type === 'add' ? parsed.groups.find(r => r.id === action.group)! : parsed.chapters.find(r => r.id === chapter)!;

@@ -61,6 +61,8 @@
   box-shadow: var(--shadow-s);
   transform: translate(-50%, -100%);
 }
+.is-mobile .hc-reading-selection { -webkit-touch-callout: none; }
+.hc-reading-actions { -webkit-touch-callout: none; user-select: none; }
 .hc-nested-keyword { margin-left: 20px; }
 .hc-responsive-modal textarea { width: 100%; min-width: 0; min-height: 140px; font-size: 16px; }
 .hc-exam-types { border-top: 1px solid var(--background-modifier-border); margin-top: 16px; }

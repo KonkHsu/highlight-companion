@@ -6,7 +6,7 @@ import { buildCanvas, CanvasLedger } from './canvas';
 import { commitCapture, commitUndo, finishPending, Storage } from './engine';
 import { removeEntries, removeHighlights, selectedEntryIds } from './undo';
 import { hideInternalMarkers } from './editor';
-import { snapshotSelection, selectionPreview, SelectionSnapshot, readingSelection } from './selection';
+import { snapshotSelection, selectionPreview, SelectionSnapshot, readingSelection, readingActionPosition } from './selection';
 import { SelectionMemory, rememberEditorSelection } from './selection-memory';
 
 export default class HighlightCompanion extends Plugin {
@@ -57,7 +57,9 @@ export default class HighlightCompanion extends Plugin {
     this.registerEvent(this.app.workspace.on('layout-change', () => this.run(() => this.refreshCanvasLinks())));
     this.registerMarkdownPostProcessor((element, context) => {
       const listener = new MarkdownRenderChild(element); context.addChild(listener);
-      type ReadingPick = { text: string; info: ReturnType<typeof context.getSectionInfo>; range: Range; file: TFile };
+      element.addClass('hc-reading-selection');
+      listener.register(() => element.removeClass('hc-reading-selection'));
+      type ReadingPick = { text: string; info: ReturnType<typeof context.getSectionInfo>; range: Range; file: TFile; neighbours: { before: string; after: string } };
       let mobileActions: HTMLElement | undefined;
       let selectionTimer: number | undefined;
       let dragging = false;
@@ -67,17 +69,22 @@ export default class HighlightCompanion extends Plugin {
         if (!selection || selection.isCollapsed || !selection.rangeCount) return;
         const range = selection.getRangeAt(0);
         if (!element.contains(range.startContainer) || !element.contains(range.endContainer)) return;
-        const info = context.getSectionInfo(element), selectedText = selection.toString();
+        const startElement = range.startContainer.nodeType === 1 ? range.startContainer as HTMLElement : range.startContainer.parentElement;
+        const block = startElement?.closest('p, li') as HTMLElement | null;
+        const scope = block && element.contains(block) && block.contains(range.endContainer) ? block : element;
+        const info = context.getSectionInfo(scope) ?? context.getSectionInfo(element), selectedText = range.toString();
         if (!info || !selectedText.trim()) return;
         const file = this.app.vault.getAbstractFileByPath(context.sourcePath);
         if (!(file instanceof TFile)) return;
-        return { text: selectedText, info, range: range.cloneRange(), file };
+        const before = range.cloneRange(); before.selectNodeContents(scope); before.setEnd(range.startContainer, range.startOffset);
+        const after = range.cloneRange(); after.selectNodeContents(scope); after.setStart(range.endContainer, range.endOffset);
+        return { text: selectedText, info, range: range.cloneRange(), file, neighbours: { before: before.toString(), after: after.toString() } };
       };
       const act = (pick: ReadingPick, undo: boolean) => this.run(async () => {
           clearMobileActions();
           const source = await this.read(pick.file.path);
           if (!pick.info || source !== pick.info.text) throw new Error('笔记已变化，请重新选择文字。');
-          const snapshot = readingSelection(source, pick.text, pick.info.lineStart, pick.info.lineEnd);
+          const snapshot = readingSelection(source, pick.text, pick.info.lineStart, pick.info.lineEnd, pick.neighbours);
           if (undo) await this.undoSnapshot(pick.file, snapshot);
           else await this.collectSnapshot(pick.file, snapshot);
       });
@@ -104,6 +111,7 @@ export default class HighlightCompanion extends Plugin {
           const rect = pick.range.getBoundingClientRect();
           if (!rect.width && !rect.height) return;
           const bar = element.ownerDocument.body.createDiv({ cls: 'hc-reading-actions' });
+          bar.setAttribute('role', 'toolbar'); bar.setAttribute('aria-label', '选中文字操作');
           mobileActions = bar;
           const add = (label: string, undo: boolean) => {
             const button = bar.createEl('button', { text: label });
@@ -111,16 +119,18 @@ export default class HighlightCompanion extends Plugin {
             listener.registerDomEvent(button, 'click', () => act(pick, undo));
           };
           add('高亮并收录', false); add('撤销高亮并移除重点', true);
-          const viewport = element.ownerDocument.defaultView?.innerWidth ?? 320;
-          const halfWidth = bar.getBoundingClientRect().width / 2;
-          bar.style.left = `${Math.max(halfWidth + 8, Math.min(rect.left + rect.width / 2, viewport - halfWidth - 8))}px`;
-          bar.style.top = `${rect.top > 110 ? rect.top - 10 : rect.bottom + 10}px`;
-          bar.classList.toggle('hc-reading-actions-below', rect.top <= 110);
+          const win = element.ownerDocument.defaultView!, viewport = win.visualViewport;
+          const position = readingActionPosition(rect, bar.getBoundingClientRect(), {
+            left: viewport?.offsetLeft ?? 0, top: viewport?.offsetTop ?? 0,
+            width: viewport?.width ?? win.innerWidth, height: viewport?.height ?? win.innerHeight
+          });
+          bar.style.transform = 'none';
+          bar.style.left = `${position.left}px`; bar.style.top = `${position.top}px`;
         }, 120);
       };
       listener.registerDomEvent(element.ownerDocument, 'selectionchange', scheduleMobileActions);
       const start = (event: Event) => { if (mobileActions?.contains(event.target as Node)) return; dragging = true; clearMobileActions(); };
-      const end = () => { dragging = false; scheduleMobileActions(); };
+      const end = (event: Event) => { if (mobileActions?.contains(event.target as Node)) return; dragging = false; scheduleMobileActions(); };
       listener.registerDomEvent(element.ownerDocument, 'touchstart', start, { passive: true });
       listener.registerDomEvent(element.ownerDocument, 'pointerdown', start, { passive: true });
       listener.registerDomEvent(element.ownerDocument, 'touchend', end, { passive: true });
